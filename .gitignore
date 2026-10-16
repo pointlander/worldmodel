@@ -1,0 +1,22 @@
+# go build writes the command here.
+/worldmodel
+
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# go test -c
+*.test
+
+*.out
+coverage.*
+!coverage.go
+*.coverprofile
+profile.cov
+
+go.work
+go.work.sum
+
+.env
