@@ -1,3 +1,7 @@
+// Copyright 2026 The WorldModel Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 // Package secom is a symmetric compressor for the SECOM semiconductor files.
 //
 // The matrix is 1567 rows by 590 space-separated features, with NaN for a

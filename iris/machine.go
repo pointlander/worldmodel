@@ -1,3 +1,7 @@
+// Copyright 2026 The WorldModel Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 // Search finds one Turing machine that writes an iris file.
 //
 // The numbering is a byte program for a single-tape machine. emit, lit, rep,
@@ -393,6 +397,10 @@ func encodeLit(data []byte) []byte {
 		data = data[n:]
 	}
 	return prog
+}
+
+func Run(prog []byte) ([]byte, error) {
+	return run(prog)
 }
 
 func run(prog []byte) ([]byte, error) {
