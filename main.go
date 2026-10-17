@@ -167,6 +167,103 @@ func decompressFactor2(blob []byte) ([]byte, error) {
 	return out, nil
 }
 
+// compressZeroDC is a test compressor. It transforms src, stores the DC bin,
+// zeros that bin, and flate-compresses the inverse transform. Restoring the
+// bin before the inverse transform returns the original bytes.
+func compressZeroDC(src []byte) ([]byte, error) {
+	spec, err := NTT(src)
+	if err != nil {
+		return nil, err
+	}
+	if len(spec) == 0 {
+		return nil, nil
+	}
+	dc := spec[0]
+	spec[0] = 0
+	time, err := INTT(spec)
+	if err != nil {
+		return nil, err
+	}
+	raw := make([]byte, 4*len(time))
+	for i, v := range time {
+		binary.LittleEndian.PutUint32(raw[4*i:], v)
+	}
+	var z bytes.Buffer
+	w, err := flate.NewWriter(&z, flate.BestCompression)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := w.Write(raw); err != nil {
+		return nil, err
+	}
+	if err := w.Close(); err != nil {
+		return nil, err
+	}
+	out := make([]byte, 12+z.Len())
+	binary.LittleEndian.PutUint32(out[0:], uint32(len(src)))
+	binary.LittleEndian.PutUint32(out[4:], uint32(len(spec)))
+	binary.LittleEndian.PutUint32(out[8:], dc)
+	copy(out[12:], z.Bytes())
+	return out, nil
+}
+
+// decompressZeroDC is the inverse of compressZeroDC.
+func decompressZeroDC(blob []byte) ([]byte, error) {
+	if len(blob) == 0 {
+		return nil, nil
+	}
+	if len(blob) < 12 {
+		return nil, errFormat
+	}
+	nSrc := int(binary.LittleEndian.Uint32(blob[0:]))
+	n := int(binary.LittleEndian.Uint32(blob[4:]))
+	dc := binary.LittleEndian.Uint32(blob[8:])
+	want, err := paddedLen(nSrc)
+	if err != nil || want != n || n == 0 || dc >= mod {
+		return nil, errFormat
+	}
+	rest := bytes.NewReader(blob[12:])
+	r := flate.NewReader(rest)
+	raw, err := io.ReadAll(r)
+	r.Close()
+	if err != nil || rest.Len() != 0 || len(raw) != 4*n {
+		return nil, errFormat
+	}
+	time := make([]uint32, n)
+	for i := range time {
+		v := binary.LittleEndian.Uint32(raw[4*i:])
+		if v >= mod {
+			return nil, errFormat
+		}
+		time[i] = v
+	}
+	transform(time, false)
+	if time[0] != 0 {
+		return nil, errFormat
+	}
+	time[0] = dc
+	got, err := INTT(time)
+	if err != nil {
+		return nil, err
+	}
+	if len(got) != n {
+		return nil, errFormat
+	}
+	for _, v := range got[nSrc:] {
+		if v != 0 {
+			return nil, errFormat
+		}
+	}
+	out := make([]byte, nSrc)
+	for i := range out {
+		if got[i] > 255 {
+			return nil, errFormat
+		}
+		out[i] = byte(got[i])
+	}
+	return out, nil
+}
+
 // factor2 divides every even residue by two. Bit i of parity is set when
 // spec[i] was even. An even residue is at most mod-1, so the quotient fits
 // and doubling it restores the residue.

@@ -67,6 +67,82 @@ func TestFactor2Compress(t *testing.T) {
 	t.Logf("iris %d bytes, flate %d, factor2 %d", len(src), z.Len(), len(blob))
 }
 
+func TestZeroDCCompress(t *testing.T) {
+	cases := [][]byte{
+		nil,
+		{0},
+		{1, 1, 1, 1},
+		{1, 2, 3},
+		{5, 5, 5, 5},
+	}
+	buf := make([]byte, 64)
+	for i := range buf {
+		buf[i] = byte(i)
+	}
+	cases = append(cases, buf)
+	for _, src := range cases {
+		blob, err := compressZeroDC(src)
+		if err != nil {
+			t.Fatalf("compress %v: %v", src, err)
+		}
+		got, err := decompressZeroDC(blob)
+		if err != nil {
+			t.Fatalf("decompress %v: %v", src, err)
+		}
+		if !bytes.Equal(got, src) {
+			t.Fatalf("got %v want %v", got, src)
+		}
+	}
+	if _, err := decompressZeroDC([]byte{1, 2, 3}); err != errFormat {
+		t.Fatalf("short: %v", err)
+	}
+
+	src, err := os.ReadFile("iris/iris.data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, err := NTT(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dc := spec[0]
+	spec[0] = 0
+	time, err := INTT(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inByte := 0
+	for _, v := range time {
+		if v <= 255 {
+			inByte++
+		}
+	}
+	blob, err := compressZeroDC(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := decompressZeroDC(blob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, src) {
+		t.Fatal("iris round trip")
+	}
+	var z bytes.Buffer
+	w, err := flate.NewWriter(&z, flate.BestCompression)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(src); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("iris %d bytes, flate %d, zerodc %d, dc %d, samples in 0..255 %d/%d",
+		len(src), z.Len(), len(blob), dc, inByte, len(time))
+}
+
 func TestRoundTrip(t *testing.T) {
 	cases := [][]byte{
 		nil,
