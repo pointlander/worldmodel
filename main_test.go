@@ -81,6 +81,11 @@ func TestZeroDCCompress(t *testing.T) {
 	}
 	cases = append(cases, buf)
 	for _, src := range cases {
+		data, err := NTT(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Log(INTT(BijectiveBurrowsWheelerCoder(data)))
 		blob, err := compressZeroDC(src)
 		if err != nil {
 			t.Fatalf("compress %v: %v", src, err)
