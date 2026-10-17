@@ -54,7 +54,7 @@ func TestFiles(t *testing.T) {
 }
 
 func TestZerosAreOneRep(t *testing.T) {
-	m, err := Search(bytes.Repeat([]byte{0}, 100))
+	m, err := Search(bytes.Repeat([]byte{0}, 100), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,12 +71,12 @@ func TestFarCopy(t *testing.T) {
 	pattern := []byte("abcdefghijklmnopqrstuvwxyz012345")
 	copy(data, pattern)
 	copy(data[len(data)-len(pattern):], pattern)
-	prog, err := Compress(data)
+	prog, err := Search(data, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(prog, []byte{opFar}) {
-		t.Fatalf("missing far copy, %d bytes", len(prog))
+	if !bytes.Contains(prog.Prog, []byte{opFar}) {
+		t.Fatalf("missing far copy, %d bytes", len(prog.Prog))
 	}
 }
 
@@ -98,7 +98,7 @@ func TestRejectsGarbage(t *testing.T) {
 
 func assertRoundTrip(t *testing.T, data []byte) Machine {
 	t.Helper()
-	m, err := Search(data)
+	m, err := Search(data, true)
 	if err != nil {
 		t.Fatal(err)
 	}
