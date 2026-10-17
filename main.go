@@ -11,8 +11,12 @@
 package main
 
 import (
+	"bytes"
+	"compress/flate"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 )
 
@@ -58,6 +62,144 @@ func main() {
 		}
 	}
 	fmt.Println(len(original), len(spec))
+}
+
+// compressFactor2 is a test compressor. It transforms src, divides every even
+// residue by two, and flate-compresses the inverse transform of that spectrum.
+// Parity bits put the factors of two back, so the pair of transforms is lossless.
+func compressFactor2(src []byte) ([]byte, error) {
+	spec, err := NTT(src)
+	if err != nil {
+		return nil, err
+	}
+	if len(spec) == 0 {
+		return nil, nil
+	}
+	folded, parity := factor2(spec)
+	time, err := INTT(folded)
+	if err != nil {
+		return nil, err
+	}
+	raw := make([]byte, 4*len(time))
+	for i, v := range time {
+		binary.LittleEndian.PutUint32(raw[4*i:], v)
+	}
+	var z bytes.Buffer
+	w, err := flate.NewWriter(&z, flate.BestCompression)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := w.Write(raw); err != nil {
+		return nil, err
+	}
+	if err := w.Close(); err != nil {
+		return nil, err
+	}
+	out := make([]byte, 8+len(parity)+z.Len())
+	binary.LittleEndian.PutUint32(out[0:], uint32(len(src)))
+	binary.LittleEndian.PutUint32(out[4:], uint32(len(spec)))
+	copy(out[8:], parity)
+	copy(out[8+len(parity):], z.Bytes())
+	return out, nil
+}
+
+// decompressFactor2 is the inverse of compressFactor2.
+func decompressFactor2(blob []byte) ([]byte, error) {
+	if len(blob) == 0 {
+		return nil, nil
+	}
+	if len(blob) < 8 {
+		return nil, errFormat
+	}
+	nSrc := int(binary.LittleEndian.Uint32(blob[0:]))
+	n := int(binary.LittleEndian.Uint32(blob[4:]))
+	want, err := paddedLen(nSrc)
+	if err != nil || want != n || n == 0 {
+		return nil, errFormat
+	}
+	pLen := (n + 7) / 8
+	if len(blob) < 8+pLen {
+		return nil, errFormat
+	}
+	if n%8 != 0 && blob[8+pLen-1]&(byte(0xff)<<(n%8)) != 0 {
+		return nil, errFormat
+	}
+	parity := blob[8 : 8+pLen]
+	rest := bytes.NewReader(blob[8+pLen:])
+	r := flate.NewReader(rest)
+	raw, err := io.ReadAll(r)
+	r.Close()
+	if err != nil || rest.Len() != 0 || len(raw) != 4*n {
+		return nil, errFormat
+	}
+	folded := make([]uint32, n)
+	for i := range folded {
+		v := binary.LittleEndian.Uint32(raw[4*i:])
+		if v >= mod {
+			return nil, errFormat
+		}
+		folded[i] = v
+	}
+	transform(folded, false)
+	spec, err := unfold2(folded, parity)
+	if err != nil {
+		return nil, err
+	}
+	time, err := INTT(spec)
+	if err != nil {
+		return nil, err
+	}
+	if len(time) != n {
+		return nil, errFormat
+	}
+	for _, v := range time[nSrc:] {
+		if v != 0 {
+			return nil, errFormat
+		}
+	}
+	out := make([]byte, nSrc)
+	for i := range out {
+		if time[i] > 255 {
+			return nil, errFormat
+		}
+		out[i] = byte(time[i])
+	}
+	return out, nil
+}
+
+// factor2 divides every even residue by two. Bit i of parity is set when
+// spec[i] was even. An even residue is at most mod-1, so the quotient fits
+// and doubling it restores the residue.
+func factor2(spec []uint32) (folded []uint32, parity []byte) {
+	folded = make([]uint32, len(spec))
+	parity = make([]byte, (len(spec)+7)/8)
+	for i, r := range spec {
+		if r&1 == 0 {
+			folded[i] = r / 2
+			parity[i/8] |= 1 << (uint(i) % 8)
+		} else {
+			folded[i] = r
+		}
+	}
+	return folded, parity
+}
+
+func unfold2(folded []uint32, parity []byte) ([]uint32, error) {
+	if len(parity) != (len(folded)+7)/8 {
+		return nil, errFormat
+	}
+	out := make([]uint32, len(folded))
+	for i, r := range folded {
+		if parity[i/8]&(1<<(uint(i)%8)) == 0 {
+			out[i] = r
+			continue
+		}
+		if r > (mod-1)/2 {
+			return nil, errFormat
+		}
+		out[i] = r * 2
+	}
+	return out, nil
 }
 
 // NTT returns the Number Theoretic Transform of src.
