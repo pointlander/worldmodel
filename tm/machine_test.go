@@ -45,8 +45,11 @@ func TestFiles(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		m := assertRoundTrip(t, original)
-		t.Logf("%s: %d -> %d bytes, %d rounds", name, len(original), len(m.Prog), len(m.Levels))
+		m, coded := assertRoundTrip(t, original)
+		if len(coded) >= len(m.Prog) {
+			t.Fatalf("table %d, program %d", len(coded), len(m.Prog))
+		}
+		t.Logf("%s: %d -> %d bytes, program %d, %d rounds", name, len(original), len(coded), len(m.Prog), len(m.Levels))
 		for i, lv := range m.Levels {
 			t.Logf("  level %d: %d machines, %d bytes", i, lv.Machines, lv.Bytes)
 		}
@@ -96,13 +99,67 @@ func TestRejectsGarbage(t *testing.T) {
 	}
 }
 
-func assertRoundTrip(t *testing.T, data []byte) Machine {
+func TestPaddingBits(t *testing.T) {
+	src := bytes.Repeat([]byte{0}, 100)
+	m, err := Search(src, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bits, err := codedBits(m.Prog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bits%8 == 0 {
+		t.Fatal("expected spare bits")
+	}
+	coded, err := pack(m.Prog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flipped := append([]byte(nil), coded...)
+	flipped[len(flipped)-1] ^= 1
+	if _, err := Decompress(flipped); err != ErrFormat {
+		t.Fatalf("padding: %v", err)
+	}
+}
+
+func TestSymbolCodes(t *testing.T) {
+	for i, tab := range []*table{opTab, lenTab, payTab, distTab} {
+		var w bitWriter
+		var seq []byte
+		for s := 0; s < len(tab.enc); s++ {
+			if tab.enc[s].n == 0 {
+				continue
+			}
+			if err := w.put(tab, byte(s)); err != nil {
+				t.Fatal(err)
+			}
+			seq = append(seq, byte(s))
+		}
+		r := bitReader{b: w.finish()}
+		for _, s := range seq {
+			got, err := r.take(tab)
+			if err != nil || got != s {
+				t.Fatalf("table %d sym %d got %d err %v", i, s, got, err)
+			}
+		}
+		if err := r.done(); err != nil {
+			t.Fatalf("table %d: %v", i, err)
+		}
+	}
+}
+
+func assertRoundTrip(t *testing.T, data []byte) (Machine, []byte) {
 	t.Helper()
 	m, err := Search(data, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := Decompress(m.Prog)
+	coded, err := pack(m.Prog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Decompress(coded)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,11 +170,11 @@ func assertRoundTrip(t *testing.T, data []byte) Machine {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(again, m.Prog) {
+	if !bytes.Equal(again, coded) {
 		t.Fatal("encoding is not stable")
 	}
 	if len(data) == 0 {
-		return m
+		return m, coded
 	}
 	if m.Levels[len(m.Levels)-1].Machines != 1 {
 		t.Fatalf("levels %+v", m.Levels)
@@ -135,5 +192,5 @@ func assertRoundTrip(t *testing.T, data []byte) Machine {
 			t.Fatalf("level %d grew %d -> %d", i, prev.Bytes, cur.Bytes)
 		}
 	}
-	return m
+	return m, coded
 }

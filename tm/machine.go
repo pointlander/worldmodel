@@ -19,6 +19,9 @@
 // copy and far append nn bytes from dist back on the tape already written.
 // A match looks at the 256 most recent earlier copies of its first three
 // bytes. rep writes one byte nn times. lit and emit write raw bytes.
+//
+// Compress writes that program with the fixed field tables in table.go.
+// The tables stay in the decoder, and the blob is the coded program.
 package tm
 
 import (
@@ -237,18 +240,22 @@ type Machine struct {
 	Levels []Level
 }
 
-// Compress returns the single program that reprints src.
+// Compress returns the table-coded program that reprints src.
 func Compress(src []byte) ([]byte, error) {
 	m, err := Search(src, true)
 	if err != nil {
 		panic(err)
 	}
-	return m.Prog, nil
+	return pack(m.Prog)
 }
 
 // Decompress runs a program produced by Compress.
 func Decompress(prog []byte) ([]byte, error) {
-	return run(prog, true)
+	raw, err := unpack(prog)
+	if err != nil {
+		return nil, err
+	}
+	return run(raw, true)
 }
 
 // Search splits src into blocks and pairs shortest programs until one remains.
