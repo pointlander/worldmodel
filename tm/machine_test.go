@@ -49,10 +49,7 @@ func TestFiles(t *testing.T) {
 		if len(coded) >= len(m.Prog) {
 			t.Fatalf("table %d, program %d", len(coded), len(m.Prog))
 		}
-		t.Logf("%s: %d -> %d bytes, program %d, %d rounds", name, len(original), len(coded), len(m.Prog), len(m.Levels))
-		for i, lv := range m.Levels {
-			t.Logf("  level %d: %d machines, %d bytes", i, lv.Machines, lv.Bytes)
-		}
+		t.Logf("%s: %d -> %d bytes, program %d", name, len(original), len(coded), len(m.Prog))
 	}
 }
 
@@ -64,7 +61,7 @@ func TestZerosAreOneRep(t *testing.T) {
 	if len(m.Prog) != 3 || m.Prog[0] != opRep || m.Prog[2] != 100 {
 		t.Fatalf("prog %x", m.Prog)
 	}
-	if len(m.Levels) != 3 || m.Levels[0].Machines != 4 || m.Levels[2].Machines != 1 {
+	if len(m.Levels) != 1 || m.Levels[0].Machines != 1 || m.Levels[0].Bytes != len(m.Prog) {
 		t.Fatalf("levels %+v", m.Levels)
 	}
 }
@@ -182,21 +179,11 @@ func assertRoundTrip(t *testing.T, data []byte) (Machine, []byte) {
 	if len(data) == 0 {
 		return m, coded
 	}
-	if m.Levels[len(m.Levels)-1].Machines != 1 {
+	if len(m.Levels) != 1 || m.Levels[0].Machines != 1 || m.Levels[0].Bytes != len(m.Prog) {
 		t.Fatalf("levels %+v", m.Levels)
 	}
-	wantBlocks := (len(data) + blockSize - 1) / blockSize
-	if m.Levels[0].Machines != wantBlocks {
-		t.Fatalf("blocks %d, want %d", m.Levels[0].Machines, wantBlocks)
-	}
-	for i := 1; i < len(m.Levels); i++ {
-		prev, cur := m.Levels[i-1], m.Levels[i]
-		if cur.Machines != (prev.Machines+1)/2 {
-			t.Fatalf("level %d machines %d, prev %d", i, cur.Machines, prev.Machines)
-		}
-		if cur.Bits > prev.Bits {
-			t.Fatalf("level %d grew %d -> %d bits", i, prev.Bits, cur.Bits)
-		}
+	if m.Levels[0].Bits != mustBits(m.Prog) {
+		t.Fatalf("bits %d, level %d", mustBits(m.Prog), m.Levels[0].Bits)
 	}
 	return m, coded
 }

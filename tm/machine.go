@@ -1,12 +1,8 @@
 // Package tm compresses arbitrary bytes as one Turing-machine program.
 //
-// The file is split into 32-byte blocks. Each block is the program with the
-// fewest bits under the fixed field tables that reprints it. Adjacent
-// programs are paired, the pair is searched again, and pairing repeats until
-// one program remains. The two child programs written end to end are one
-// candidate; the other is a fresh program for the concatenated bytes. Chunks
-// of at most 8192 bytes are solved exactly. Larger chunks use a greedy parse,
-// kept when it costs fewer bits than the children.
+// Search applies a bijective Burrows-Wheeler transform and move-to-front,
+// then solves one dynamic program for the fewest bits under the fixed field
+// tables. Each tape position is reached by an emit, lit, rep, copy, or far.
 //
 // Instructions:
 //
@@ -265,11 +261,9 @@ const (
 	opCopy = 4
 	opFar  = 5
 
-	blockSize  = 32
-	exactLimit = 8192
-	maxProbe   = 256
-	maxCopy    = 255
-	maxDist16  = 65535
+	maxProbe  = 256
+	maxCopy   = 255
+	maxDist16 = 65535
 )
 
 // cheapNear and cheapFar are the fewest fixed-table bits a near or far
@@ -305,8 +299,8 @@ var ErrFormat = errors.New("tm: invalid program")
 
 var errMismatch = errors.New("tm: encode mismatch")
 
-// Level is one round of pairing. Bytes is the sum of the program lengths.
-// Bits is that length under the fixed field tables.
+// Level is the program Search found. Bytes is its length and Bits is that
+// length under the fixed field tables.
 type Level struct {
 	Machines int
 	Bytes    int
@@ -337,7 +331,7 @@ func Decompress(prog []byte) ([]byte, error) {
 	return run(raw, true)
 }
 
-// Search splits src into blocks and pairs shortest programs until one remains.
+// Search returns the program with the fewest fixed-table bits that reprints src.
 func Search(src []byte, enc bool) (Machine, error) {
 	if len(src) == 0 {
 		return Machine{}, nil
@@ -348,46 +342,15 @@ func Search(src []byte, enc bool) (Machine, error) {
 		src = BijectiveBurrowsWheelerCoder(cp)
 		src = MoveToFrontCoder(src)
 	}
-	blocks := splitBlocks(src)
-	progs := make([][]byte, len(blocks))
-	for i, block := range blocks {
-		progs[i] = encode(block)
-		if err := matches(progs[i], block); err != nil {
-			panic(err)
-		}
+	prog := encodeDP(src)
+	if err := matches(prog, src); err != nil {
+		panic(err)
 	}
-	levels := []Level{levelOf(progs)}
-	for len(progs) > 1 {
-		next := make([][]byte, 0, (len(progs)+1)/2)
-		nextData := make([][]byte, 0, (len(progs)+1)/2)
-		for i := 0; i < len(progs); i += 2 {
-			if i+1 == len(progs) {
-				next = append(next, progs[i])
-				nextData = append(nextData, blocks[i])
-				continue
-			}
-			cat := append(append([]byte{}, blocks[i]...), blocks[i+1]...)
-			prog, err := combine(progs[i], progs[i+1], cat)
-			if err != nil {
-				panic(err)
-			}
-			next = append(next, prog)
-			nextData = append(nextData, cat)
-		}
-		progs = next
-		blocks = nextData
-		levels = append(levels, levelOf(progs))
-	}
-	return Machine{Prog: progs[0], Levels: levels}, nil
-}
-
-func levelOf(progs [][]byte) Level {
-	n, bits := 0, 0
-	for _, p := range progs {
-		n += len(p)
-		bits += mustBits(p)
-	}
-	return Level{Machines: len(progs), Bytes: n, Bits: bits}
+	return Machine{Prog: prog, Levels: []Level{{
+		Machines: 1,
+		Bytes:    len(prog),
+		Bits:     mustBits(prog),
+	}}}, nil
 }
 
 func mustBits(prog []byte) int {
@@ -396,33 +359,6 @@ func mustBits(prog []byte) int {
 		panic(err)
 	}
 	return n
-}
-
-func splitBlocks(data []byte) [][]byte {
-	blocks := make([][]byte, 0, (len(data)+blockSize-1)/blockSize)
-	for i := 0; i < len(data); i += blockSize {
-		j := i + blockSize
-		if j > len(data) {
-			j = len(data)
-		}
-		blocks = append(blocks, data[i:j])
-	}
-	return blocks
-}
-
-func combine(left, right, data []byte) ([]byte, error) {
-	cat := make([]byte, 0, len(left)+len(right))
-	cat = append(cat, left...)
-	cat = append(cat, right...)
-	joint := encode(data)
-	best := cat
-	if better(joint, cat) {
-		best = joint
-	}
-	if err := matches(best, data); err != nil {
-		return nil, err
-	}
-	return best, nil
 }
 
 func matches(prog, data []byte) error {
@@ -434,20 +370,6 @@ func matches(prog, data []byte) error {
 		return errMismatch
 	}
 	return nil
-}
-
-// better reports whether a costs fewer fixed-table bits than b.
-// Equal bit costs keep the shorter program, then the lexicographically
-// earlier bytes.
-func better(a, b []byte) bool {
-	ab, bb := mustBits(a), mustBits(b)
-	if ab != bb {
-		return ab < bb
-	}
-	if len(a) != len(b) {
-		return len(a) < len(b)
-	}
-	return bytes.Compare(a, b) < 0
 }
 
 func emitBits(b byte) int {
@@ -465,16 +387,6 @@ func distBits(dist int, far bool) int {
 			int(distLen[byte(dist>>16)]) + int(distLen[byte(dist>>24)])
 	}
 	return int(opLen[opCopy]) + int(distLen[byte(dist)]) + int(distLen[byte(dist>>8)])
-}
-
-func encode(data []byte) []byte {
-	if len(data) == 0 {
-		return nil
-	}
-	if len(data) <= exactLimit {
-		return encodeDP(data)
-	}
-	return encodeGreedy(data)
 }
 
 type link struct {
@@ -567,139 +479,6 @@ func relax(links []link, pos, cost, prev int, op byte, a, b int) {
 	}
 }
 
-func encodeGreedy(data []byte) []byte {
-	c := newCoder(data)
-	var prog []byte
-	lit := -1
-	flush := func(end int) {
-		if lit < 0 {
-			return
-		}
-		prog = append(prog, encodeLit(data[lit:end])...)
-		lit = -1
-	}
-	for p := 0; p < len(data); {
-		run := c.run[p]
-		if run > maxCopy {
-			run = maxCopy
-		}
-		kind, n, dist, far := c.choose(p, run)
-		if kind == 0 {
-			if lit < 0 {
-				lit = p
-			}
-			c.add(p)
-			p++
-			if p-lit == maxCopy {
-				flush(p)
-			}
-			continue
-		}
-		flush(p)
-		if kind == opRep {
-			prog = append(prog, opRep, data[p], byte(n))
-		} else {
-			prog = append(prog, emitCopy(dist, n, far)...)
-		}
-		for j := p; j < p+n; j++ {
-			c.add(j)
-		}
-		p += n
-	}
-	flush(len(data))
-	return prog
-}
-
-// choose picks a rep or a copy when its fixed-table cost beats writing the
-// same bytes as a literal. kind 0 means the caller should emit a literal byte.
-func (c *coder) choose(p, run int) (kind byte, n, dist int, far bool) {
-	span := c.data[p:]
-	ms := c.candsAt(p)
-	limit := run
-	for _, m := range ms {
-		if m.l > limit {
-			limit = m.l
-		}
-	}
-	if limit > maxCopy {
-		limit = maxCopy
-	}
-	if limit > len(span) {
-		limit = len(span)
-	}
-	if cap(c.raw) < limit+1 {
-		c.raw = make([]int, limit+1)
-	}
-	raw := c.raw[:limit+1]
-	acc := 0
-	for k := 1; k <= limit; k++ {
-		acc += int(payLen[span[k-1]])
-		if k == 1 {
-			raw[k] = int(opLen[opEmit]) + acc
-			continue
-		}
-		raw[k] = int(opLen[opLit]) + int(lenLen[k]) + acc
-	}
-	type opt struct {
-		kind byte
-		n    int
-		dist int
-		far  bool
-		cost int
-	}
-	var best opt
-	consider := func(o opt) {
-		if o.n < 2 || (o.kind != opRep && o.n < 3) || o.n > limit {
-			return
-		}
-		if o.cost >= raw[o.n] {
-			return
-		}
-		if best.kind == 0 || o.cost*best.n < best.cost*o.n || (o.cost*best.n == best.cost*o.n && o.n > best.n) {
-			best = o
-		}
-	}
-	if run > limit {
-		run = limit
-	}
-	for k := 2; k <= run; k++ {
-		consider(opt{kind: opRep, n: k, cost: repBits(span[0], k)})
-	}
-	for _, m := range ms {
-		op := byte(opCopy)
-		if m.far {
-			op = opFar
-		}
-		ln := m.l
-		if ln > limit {
-			ln = limit
-		}
-		for k := 3; k <= ln; k++ {
-			consider(opt{kind: op, n: k, dist: m.dist, far: m.far, cost: m.base + int(lenLen[k])})
-		}
-	}
-	return best.kind, best.n, best.dist, best.far
-}
-
-func encodeLit(data []byte) []byte {
-	var prog []byte
-	for len(data) > 0 {
-		n := len(data)
-		if n > maxCopy {
-			n = maxCopy
-		}
-		if n == 1 {
-			prog = append(prog, opEmit, data[0])
-			data = data[1:]
-			continue
-		}
-		prog = append(prog, opLit, byte(n))
-		prog = append(prog, data[:n]...)
-		data = data[n:]
-	}
-	return prog
-}
-
 func emitCopy(dist, n int, far bool) []byte {
 	if !far {
 		return []byte{opCopy, byte(dist), byte(dist >> 8), byte(n)}
@@ -721,7 +500,6 @@ type coder struct {
 	head  []int
 	next  []int
 	cands []cand
-	raw   []int
 }
 
 func newCoder(data []byte) *coder {
