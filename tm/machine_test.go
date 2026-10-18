@@ -100,21 +100,27 @@ func TestRejectsGarbage(t *testing.T) {
 }
 
 func TestPaddingBits(t *testing.T) {
-	src := bytes.Repeat([]byte{0}, 100)
-	m, err := Search(src, true)
-	if err != nil {
-		t.Fatal(err)
+	var coded []byte
+	for n := 2; n <= 40; n++ {
+		m, err := Search(bytes.Repeat([]byte{0}, n), true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bits, err := codedBits(m.Prog)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bits%8 == 0 {
+			continue
+		}
+		coded, err = pack(m.Prog)
+		if err != nil {
+			t.Fatal(err)
+		}
+		break
 	}
-	bits, err := codedBits(m.Prog)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if bits%8 == 0 {
+	if coded == nil {
 		t.Fatal("expected spare bits")
-	}
-	coded, err := pack(m.Prog)
-	if err != nil {
-		t.Fatal(err)
 	}
 	flipped := append([]byte(nil), coded...)
 	flipped[len(flipped)-1] ^= 1
@@ -188,8 +194,8 @@ func assertRoundTrip(t *testing.T, data []byte) (Machine, []byte) {
 		if cur.Machines != (prev.Machines+1)/2 {
 			t.Fatalf("level %d machines %d, prev %d", i, cur.Machines, prev.Machines)
 		}
-		if cur.Bytes > prev.Bytes {
-			t.Fatalf("level %d grew %d -> %d", i, prev.Bytes, cur.Bytes)
+		if cur.Bits > prev.Bits {
+			t.Fatalf("level %d grew %d -> %d bits", i, prev.Bits, cur.Bits)
 		}
 	}
 	return m, coded
