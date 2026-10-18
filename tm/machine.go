@@ -209,6 +209,54 @@ func BijectiveBurrowsWheelerDecoder(buffer []byte) {
 	inverse(buffer)
 }
 
+func MoveToFrontCoder(block []byte) []byte {
+	nodes, buffer := [256]byte{}, make([]byte, 0, len(block))
+	var first byte
+
+	for node, _ := range nodes {
+		nodes[node] = uint8(node) + 1
+	}
+
+	for _, v := range block {
+		var node, next byte
+		var symbol uint8
+		for next = first; next != v; node, next = next, nodes[next] {
+			symbol++
+		}
+
+		buffer = append(buffer, symbol)
+		if symbol != 0 {
+			first, nodes[node], nodes[next] = next, nodes[next], first
+		}
+	}
+	return buffer
+}
+
+func MoveToFrontDecoder(block []byte) []byte {
+	nodes, buffer := [256]byte{}, make([]byte, 0, len(block))
+	var first byte
+
+	for node, _ := range nodes {
+		nodes[node] = uint8(node) + 1
+	}
+
+	for _, symbol := range block {
+		var node, next byte
+		moveToFront := symbol != 0
+		for next = first; symbol > 0; node, next = next, nodes[next] {
+			symbol--
+		}
+
+		if moveToFront {
+			first, nodes[node], nodes[next] = next, nodes[next], first
+		}
+
+		buffer = append(buffer, next)
+	}
+
+	return buffer
+}
+
 const (
 	opEmit = 1
 	opLit  = 2
@@ -267,6 +315,7 @@ func Search(src []byte, enc bool) (Machine, error) {
 		cp := make([]byte, len(src))
 		copy(cp, src)
 		src = BijectiveBurrowsWheelerCoder(cp)
+		src = MoveToFrontCoder(src)
 	}
 	blocks := splitBlocks(src)
 	progs := make([][]byte, len(blocks))
@@ -711,6 +760,7 @@ func run(prog []byte, decode bool) ([]byte, error) {
 		}
 	}
 	if decode {
+		out = MoveToFrontDecoder(out)
 		BijectiveBurrowsWheelerDecoder(out)
 	}
 	return out, nil
