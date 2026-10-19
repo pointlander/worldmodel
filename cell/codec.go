@@ -124,6 +124,174 @@ func Compress(src []byte) ([]byte, error) {
 	return w.finish(), nil
 }
 
+// nVecSym is the number of motion vectors the codec can write.
+const nVecSym = (2*mvRange + 1) * (2*mvRange + 1)
+
+// Predict extends a compressed clip by 33 frames.
+//
+// Each block's motion vector is a Markov chain learned from the clip.
+// A draw proposes one vector per block; the codeword actually written is
+// the stored motion field closest to that proposal, so the blocks stay on
+// a field the codec produced. Those vectors, plus a zero level code for
+// every bright sample, are what the decompressor reads back. A pixel
+// becomes the sample its vector points at.
+func Predict(blob []byte) ([half][pixels]byte, error) {
+	var out [half][pixels]byte
+	raw, err := Decompress(blob)
+	if err != nil {
+		return out, err
+	}
+	pix, err := parse(raw)
+	if err != nil {
+		return out, err
+	}
+	trans, marg, fields := learnMotion(&pix)
+	state := fields[len(fields)-1]
+	cur := pix[frames-1]
+	rng := lcg(1)
+	for f := range out {
+		var prop [nBlock][2]int
+		for b := range prop {
+			id := vectorID(state[b][0], state[b][1])
+			id = draw(&rng, &trans[id], &marg)
+			prop[b][0], prop[b][1] = idVector(id)
+		}
+		mv := nearestField(fields, prop)
+		next, err := stepCompressed(&cur, mv)
+		if err != nil {
+			return out, err
+		}
+		out[f] = next
+		cur = next
+		state = mv
+	}
+	return out, nil
+}
+
+func learnMotion(pix *[frames][pixels]byte) ([nVecSym][nVecSym]int, [nVecSym]int, [][nBlock][2]int) {
+	var trans [nVecSym][nVecSym]int
+	var marg [nVecSym]int
+	fields := make([][nBlock][2]int, 0, frames-1)
+	var prev [nBlock]int
+	seen := false
+	for f := 1; f < frames; f++ {
+		mv := searchMV(&pix[f-1], &pix[f])
+		fields = append(fields, mv)
+		for b, v := range mv {
+			id := vectorID(v[0], v[1])
+			marg[id]++
+			if seen {
+				trans[prev[b]][id]++
+			}
+			prev[b] = id
+		}
+		seen = true
+	}
+	return trans, marg, fields
+}
+
+func nearestField(fields [][nBlock][2]int, prop [nBlock][2]int) [nBlock][2]int {
+	best := 0
+	bestH, bestL := nBlock+1, 0
+	for i, f := range fields {
+		h, l := 0, 0
+		for b := range f {
+			if f[b] != prop[b] {
+				h++
+			}
+			l += iabs(f[b][0]-prop[b][0]) + iabs(f[b][1]-prop[b][1])
+		}
+		if h < bestH || (h == bestH && l < bestL) {
+			bestH, bestL, best = h, l, i
+		}
+	}
+	return fields[best]
+}
+
+func stepCompressed(cur *[pixels]byte, mv [nBlock][2]int) ([pixels]byte, error) {
+	var next [pixels]byte
+	var w bits
+	for _, v := range mv {
+		w.vector(v[0], v[1])
+	}
+	var pred [pixels]byte
+	for p := range pred {
+		pred[p] = predAt(cur, mv, p)
+		if pred[p] > 1 {
+			w.rice(0, kStay)
+		}
+	}
+	r := reader{b: w.finish()}
+	var got [nBlock][2]int
+	for b := range got {
+		dx, dy, err := r.vector()
+		if err != nil {
+			return next, err
+		}
+		got[b] = [2]int{dx, dy}
+	}
+	for p := range next {
+		pr := predAt(cur, got, p)
+		if pr <= 1 {
+			next[p] = pr
+			continue
+		}
+		v, err := r.level(pr)
+		if err != nil {
+			return next, err
+		}
+		next[p] = byte(v)
+	}
+	if err := r.done(); err != nil {
+		return next, err
+	}
+	return next, nil
+}
+
+func vectorID(dx, dy int) int {
+	span := 2*mvRange + 1
+	return (dy+mvRange)*span + (dx + mvRange)
+}
+
+func idVector(id int) (int, int) {
+	span := 2*mvRange + 1
+	return id%span - mvRange, id/span - mvRange
+}
+
+// lcg is the fixed generator for the forecast. The multiplier is the
+// Numerical Recipes constant; the low bits are not used.
+type lcg uint64
+
+func (r *lcg) next() uint32 {
+	*r = *r*1664525 + 1013904223
+	return uint32(*r >> 32)
+}
+
+func draw(r *lcg, row *[nVecSym]int, marg *[nVecSym]int) int {
+	counts := row[:]
+	total := 0
+	for _, c := range counts {
+		total += c
+	}
+	if total == 0 {
+		counts = marg[:]
+		for _, c := range counts {
+			total += c
+		}
+	}
+	if total == 0 {
+		return vectorID(0, 0)
+	}
+	u := int(r.next() % uint32(total))
+	for i, c := range counts {
+		u -= c
+		if u < 0 {
+			return i
+		}
+	}
+	return vectorID(0, 0)
+}
+
 // Decompress restores the exact file bytes written by Compress.
 func Decompress(src []byte) ([]byte, error) {
 	r := reader{b: src}

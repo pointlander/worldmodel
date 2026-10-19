@@ -7,6 +7,10 @@
 // ffmpeg decodes the video, scales every frame to 32x32, then converts
 // that frame to grayscale. Each row is the frame time in seconds followed
 // by the 1024 intensities in row-major order.
+//
+// cell predict writes the original frames, then 33 future frames, as a GIF.
+// A Markov chain on the clip's motion codes supplies the compressed vectors,
+// and the decompressor turns those vectors into pixels.
 package main
 
 import (
@@ -38,8 +42,11 @@ func main() {
 }
 
 func run(args []string) error {
+	if len(args) > 0 && args[0] == "predict" {
+		return forecast(args[1:])
+	}
 	if len(args) > 2 {
-		return errors.New("usage: cell [video] [csv]")
+		return errors.New("usage: cell [video] [csv]\n       cell predict [csv] [gif]")
 	}
 	video, err := videoPath(args)
 	if err != nil {

@@ -6,7 +6,9 @@ package main
 
 import (
 	"bytes"
+	"image/gif"
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -30,6 +32,90 @@ func TestRoundTrip(t *testing.T) {
 		t.Fatal("round trip mismatch")
 	}
 	t.Logf("cell.csv: %d -> %d bytes", len(original), len(compressed))
+}
+
+func TestPredict(t *testing.T) {
+	original, err := os.ReadFile("cell.csv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob, err := Compress(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	future, err := Predict(blob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := Predict(blob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if future != again {
+		t.Fatal("forecast changed between draws")
+	}
+	pix, err := parse(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	moved := false
+	for f := range future {
+		if future[f] != pix[frames-1] {
+			moved = true
+			break
+		}
+	}
+	if !moved {
+		t.Fatal("forecast did not move")
+	}
+	bright := 0
+	for _, v := range future[half-1] {
+		if v > 1 {
+			bright++
+		}
+	}
+	if bright < 40 {
+		t.Fatalf("cells faded: %d bright pixels", bright)
+	}
+	clip := make([][pixels]byte, 0, frames+half)
+	for f := range pix {
+		clip = append(clip, pix[f])
+	}
+	clip = append(clip, future[:]...)
+	path := filepath.Join(t.TempDir(), "future.gif")
+	if err := writeGIF(path, clip); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	g, err := gif.DecodeAll(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(g.Image) != frames+half || len(g.Delay) != frames+half {
+		t.Fatalf("gif frames %d delays %d", len(g.Image), len(g.Delay))
+	}
+	if g.Image[0].Bounds().Dx() != width*gifScale || g.Image[0].Bounds().Dy() != height*gifScale {
+		t.Fatalf("gif size %v", g.Image[0].Bounds())
+	}
+	check := func(frame, x, y int, want byte) {
+		t.Helper()
+		got := g.Image[frame].ColorIndexAt(x*gifScale, y*gifScale)
+		if got != want {
+			t.Fatalf("frame %d pixel %d,%d = %d, want %d", frame, x, y, got, want)
+		}
+	}
+	check(0, 0, 0, pix[0][0])
+	check(frames-1, 4, 4, pix[frames-1][4*width+4])
+	check(frames, 4, 4, future[0][4*width+4])
+	for _, d := range g.Delay {
+		if d != gifDelay {
+			t.Fatalf("delay %d", d)
+		}
+	}
 }
 
 func TestRejects(t *testing.T) {
