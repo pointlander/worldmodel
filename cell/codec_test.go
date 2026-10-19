@@ -12,6 +12,26 @@ import (
 	"testing"
 )
 
+func TestStayCodes(t *testing.T) {
+	for ctx := range stayModel {
+		for _, pair := range stayModel[ctx] {
+			sym := int(pair[0])
+			var w bits
+			if err := w.writeStay(ctx, sym); err != nil {
+				t.Fatal(err)
+			}
+			r := reader{b: w.finish()}
+			got, err := r.readStay(ctx)
+			if err != nil || got != sym {
+				t.Fatalf("ctx %d sym %d got %d err %v", ctx, sym, got, err)
+			}
+			if err := r.done(); err != nil {
+				t.Fatalf("ctx %d sym %d tail: %v", ctx, sym, err)
+			}
+		}
+	}
+}
+
 func TestRoundTrip(t *testing.T) {
 	original, err := os.ReadFile("cell.csv")
 	if err != nil {

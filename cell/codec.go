@@ -27,14 +27,13 @@ const (
 	kOnes   = 4
 	kValue  = 5
 	kNew    = 3
-	kStay   = 4
 	kMove   = 0
 	kCorr   = 5
 )
 
 // CompressedSize is the length of the blob for the canonical cell.csv.
-// 45207 bits is the fixed-parameter motion coding of that file.
-const CompressedSize = 5651
+// 42354 bits is the motion coding with lifting details on the stay residuals.
+const CompressedSize = 5295
 
 // ErrFormat reports an input that is not the canonical cell clip or a blob
 // this model can decode.
@@ -48,9 +47,11 @@ var ErrFormat = errors.New("cell: invalid data")
 // frame by at most two pixels. A zero vector is one bit; any other vector
 // is a zigzag Rice pair. Pixels whose brightness the translation gets wrong
 // are a gap-Rice correction of the bright mask. A translated bright pixel
-// stores a Rice residual from the pixel it came from, and a newly bright
-// pixel stores its level above 1. Ones stay an absolute gap-Rice mask.
-// Decompress applies those same translations and residuals.
+// stores the detail of a causal lifting step around the average of the stay
+// residuals already coded above and to the left. Sixteen contexts, from the
+// absolute size of those neighbors, each have a fixed canonical code. A newly
+// bright pixel stores its level above 1. Ones stay an absolute gap-Rice mask.
+// Decompress applies those same translations and details.
 
 var head string
 
@@ -114,7 +115,13 @@ func Compress(src []byte) ([]byte, error) {
 	}
 	writeGaps(&w, xors, kXor)
 	for _, lv := range levels {
-		w.rice(lv[1], lv[0])
+		if lv.stay {
+			if err := w.writeStay(lv.ctx, lv.sym); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		w.rice(lv.sym, lv.k)
 	}
 	writeGaps(&w, ones, kOnes)
 	writeGaps(&w, corr, kCorr)
@@ -132,9 +139,9 @@ const nVecSym = (2*mvRange + 1) * (2*mvRange + 1)
 // Each block's motion vector is a Markov chain learned from the clip.
 // A draw proposes one vector per block; the codeword actually written is
 // the stored motion field closest to that proposal, so the blocks stay on
-// a field the codec produced. Those vectors, plus a zero level code for
-// every bright sample, are what the decompressor reads back. A pixel
-// becomes the sample its vector points at.
+// a field the codec produced. Those vectors, and a stay code that
+// reconstructs a zero residual at every bright sample, are what the
+// decompressor reads back. A pixel becomes the sample its vector points at.
 func Predict(blob []byte) ([half][pixels]byte, error) {
 	var out [half][pixels]byte
 	raw, err := Decompress(blob)
@@ -215,11 +222,18 @@ func stepCompressed(cur *[pixels]byte, mv [nBlock][2]int) ([pixels]byte, error) 
 		w.vector(v[0], v[1])
 	}
 	var pred [pixels]byte
+	var isStay [pixels]bool
+	var resid [pixels]int
 	for p := range pred {
 		pred[p] = predAt(cur, mv, p)
-		if pred[p] > 1 {
-			w.rice(0, kStay)
+		if pred[p] <= 1 {
+			continue
 		}
+		hat, ctx := stayPredict(&isStay, &resid, p)
+		if err := w.writeStay(ctx, zig(-hat)); err != nil {
+			return next, err
+		}
+		isStay[p] = true
 	}
 	r := reader{b: w.finish()}
 	var got [nBlock][2]int
@@ -230,16 +244,25 @@ func stepCompressed(cur *[pixels]byte, mv [nBlock][2]int) ([pixels]byte, error) 
 		}
 		got[b] = [2]int{dx, dy}
 	}
+	var gotStay [pixels]bool
+	var gotResid [pixels]int
 	for p := range next {
 		pr := predAt(cur, got, p)
 		if pr <= 1 {
 			next[p] = pr
 			continue
 		}
-		v, err := r.level(pr)
+		hat, ctx := stayPredict(&gotStay, &gotResid, p)
+		sym, err := r.readStay(ctx)
 		if err != nil {
 			return next, err
 		}
+		v := int(pr) + hat + unzig(sym)
+		if v < 2 || v > 255 {
+			return next, ErrFormat
+		}
+		gotResid[p] = v - int(pr)
+		gotStay[p] = true
 		next[p] = byte(v)
 	}
 	if err := r.done(); err != nil {
@@ -353,14 +376,31 @@ func Decompress(src []byte) ([]byte, error) {
 			bright[p] = !bright[p]
 			xi++
 		}
+		var isStay [pixels]bool
+		var resid [pixels]int
 		for p := range pixels {
 			if !bright[p] {
 				continue
 			}
-			v, err := r.level(pred[p])
+			if pred[p] <= 1 {
+				v, err := r.level(pred[p])
+				if err != nil {
+					return nil, err
+				}
+				pix[dest][p] = byte(v)
+				continue
+			}
+			hat, ctx := stayPredict(&isStay, &resid, p)
+			sym, err := r.readStay(ctx)
 			if err != nil {
 				return nil, err
 			}
+			v := int(pred[p]) + hat + unzig(sym)
+			if v < 2 || v > 255 {
+				return nil, ErrFormat
+			}
+			resid[p] = v - int(pred[p])
+			isStay[p] = true
 			pix[dest][p] = byte(v)
 		}
 	}
@@ -408,21 +448,41 @@ func Decompress(src []byte) ([]byte, error) {
 	return format(pix), nil
 }
 
-func motionOf(pix *[frames][pixels]byte) ([half - 1][nBlock][2]int, []int, [][2]int) {
+// A coded level is a new bright pixel, stored as a Rice value above 1, or
+// the zigzag detail of a stay residual.
+type codedLevel struct {
+	stay bool
+	k    int
+	sym  int
+	ctx  int
+}
+
+func motionOf(pix *[frames][pixels]byte) ([half - 1][nBlock][2]int, []int, []codedLevel) {
 	var vecs [half - 1][nBlock][2]int
 	var xors []int
-	var levels [][2]int
+	var levels []codedLevel
 	for f := 1; f < half; f++ {
 		vecs[f-1] = searchMV(&pix[f-1], &pix[f])
+		var isStay [pixels]bool
+		var resid [pixels]int
 		for p := range pixels {
 			pred := predAt(&pix[f-1], vecs[f-1], p)
 			cur := pix[f][p]
 			if (pred > 1) != (cur > 1) {
 				xors = append(xors, (f-1)*pixels+p)
 			}
-			if k, v, ok := residual(pred, cur); ok {
-				levels = append(levels, [2]int{k, v})
+			if cur <= 1 {
+				continue
 			}
+			if pred <= 1 {
+				levels = append(levels, codedLevel{k: kNew, sym: int(cur) - 2})
+				continue
+			}
+			hat, ctx := stayPredict(&isStay, &resid, p)
+			lv := int(cur) - int(pred)
+			levels = append(levels, codedLevel{stay: true, sym: zig(lv - hat), ctx: ctx})
+			resid[p] = lv
+			isStay[p] = true
 		}
 	}
 	return vecs, xors, levels
@@ -442,16 +502,6 @@ func sample(src *[pixels]byte, x, y int) byte {
 		return 0
 	}
 	return src[y*width+x]
-}
-
-func residual(pred, cur byte) (k, v int, ok bool) {
-	if cur <= 1 {
-		return 0, 0, false
-	}
-	if pred > 1 {
-		return kStay, zig(int(cur) - int(pred)), true
-	}
-	return kNew, int(cur) - 2, true
 }
 
 func searchMV(prev, cur *[pixels]byte) [nBlock][2]int {
@@ -571,15 +621,7 @@ func (r *reader) motion() (int, error) {
 
 func (r *reader) level(pred byte) (int, error) {
 	if pred > 1 {
-		d, err := r.rice(kStay)
-		if err != nil {
-			return 0, err
-		}
-		v := int(pred) + unzig(d)
-		if v < 2 || v > 255 {
-			return 0, ErrFormat
-		}
-		return v, nil
+		return 0, ErrFormat
 	}
 	d, err := r.rice(kNew)
 	if err != nil {
