@@ -9,8 +9,8 @@
 // of every pixel in row-major order.
 //
 // cell predict writes the original frames, then 33 future frames, as a GIF.
-// Each cell keeps the velocity of its centroid, and the decompressor turns
-// those motion vectors into pixels.
+// A Markov chain draws the next motion field, and each cell's elastic mesh
+// is integrated under that field.
 package main
 
 import (

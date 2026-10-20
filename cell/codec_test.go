@@ -35,6 +35,68 @@ func TestRoundTrip(t *testing.T) {
 	t.Logf("cell.csv: %d -> %d bytes", len(original), len(compressed))
 }
 
+func TestTriangleRestores(t *testing.T) {
+	m := feaMesh{nodes: []feaNode{
+		{X: 0, Y: 0, x: 0, y: 0, m: 1},
+		{X: 1, Y: 0, x: 1.1, y: 0, m: 1},
+		{X: 0, Y: 1, x: 0, y: 1, m: 1},
+	}}
+	m.addTri(0, 1, 2)
+	fx, fy := m.forces()
+	sx, sy := 0.0, 0.0
+	for i := range fx {
+		sx += fx[i]
+		sy += fy[i]
+	}
+	if sx > 1e-9 || sx < -1e-9 || sy > 1e-9 || sy < -1e-9 {
+		t.Fatalf("forces do not balance: %v %v", sx, sy)
+	}
+	// Node 1 is stretched in +x, so the internal force on it points +x
+	// and the integrator pulls it back.
+	if fx[1] <= 0 {
+		t.Fatalf("stretched node force %v", fx[1])
+	}
+	want := 5.0 / 91.0
+	if fx[1]-want > 1e-9 || want-fx[1] > 1e-9 {
+		t.Fatalf("node force %v, want %v", fx[1], want)
+	}
+	m.nodes[0].x, m.nodes[0].y = 4, -3
+	m.nodes[1].x, m.nodes[1].y = 5, -3
+	m.nodes[2].x, m.nodes[2].y = 4, -2
+	for i := range m.nodes {
+		m.nodes[i].vx = 0.2
+		m.nodes[i].vy = -0.1
+	}
+	fx, fy = m.forces()
+	for i := range fx {
+		if fx[i] > 1e-9 || fx[i] < -1e-9 || fy[i] > 1e-9 || fy[i] < -1e-9 {
+			t.Fatalf("rigid motion produced a force %v %v", fx[i], fy[i])
+		}
+	}
+}
+
+func TestFieldTranslates(t *testing.T) {
+	m := feaMesh{nodes: []feaNode{
+		{X: 1, Y: 1, x: 1, y: 1},
+		{X: 2, Y: 1, x: 2, y: 1},
+		{X: 1, Y: 2, x: 1, y: 2},
+	}}
+	m.addTri(0, 1, 2)
+	var mv [nBlock][2]int
+	mv[blockAt(1, 1)] = [2]int{1, 0}
+	m.advanceDriven(1, &mv)
+	for i := range m.nodes {
+		got := m.nodes[i].x - m.nodes[i].X
+		if got < 0.7 || got > 0.85 {
+			t.Fatalf("node %d moved %v", i, got)
+		}
+	}
+	span := m.nodes[1].x - m.nodes[0].x
+	if span < 0.95 || span > 1.05 {
+		t.Fatalf("edge stretched to %v", span)
+	}
+}
+
 func TestPredict(t *testing.T) {
 	original, err := os.ReadFile("cell.csv")
 	if err != nil {
