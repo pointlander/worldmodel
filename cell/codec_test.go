@@ -69,14 +69,28 @@ func TestPredict(t *testing.T) {
 	if !moved {
 		t.Fatal("forecast did not move")
 	}
-	bright := 0
+	bright, srcBright := 0, 0
 	for _, v := range future[half-1] {
 		if luma(v) > 1 {
 			bright++
 		}
 	}
-	if bright < 40 {
-		t.Fatalf("cells faded: %d bright pixels", bright)
+	for _, v := range pix[frames-1] {
+		if luma(v) > 1 {
+			srcBright++
+		}
+	}
+	if bright*5 < srcBright*4 {
+		t.Fatalf("cells faded: %d bright pixels, source had %d", bright, srcBright)
+	}
+	kept := 0
+	for _, c := range components(&future[half-1]) {
+		if len(c.pix) >= cellMin {
+			kept++
+		}
+	}
+	if kept < 3 {
+		t.Fatalf("cells lost: %d remain", kept)
 	}
 	clip := make([][pixels]rgb, 0, frames+half)
 	for f := range pix {

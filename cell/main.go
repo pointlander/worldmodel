@@ -9,8 +9,8 @@
 // of every pixel in row-major order.
 //
 // cell predict writes the original frames, then 33 future frames, as a GIF.
-// A Markov chain on the clip's motion codes supplies the compressed vectors,
-// and the decompressor turns those vectors into pixels.
+// Each cell keeps the velocity of its centroid, and the decompressor turns
+// those motion vectors into pixels.
 package main
 
 import (

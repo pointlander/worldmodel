@@ -170,16 +170,21 @@ func writeDelta(w *bits, p *plane, kPos, kVal int) {
 	}
 }
 
-// nVecSym is the number of motion vectors the codec can write.
-const nVecSym = (2*mvRange + 1) * (2*mvRange + 1)
+// trackLag is how many frames a cell's centroid velocity is averaged over.
+// One frame of block motion is a noisy pixel, and integrating that for the
+// whole forecast walks the cell off the picture.
+const trackLag = 8
+
+// cellMin is the smallest connected bright component treated as a cell.
+const cellMin = 8
 
 // Predict extends a compressed clip by 33 frames.
 //
-// Each block's motion vector is a Markov chain learned from the clip.
-// A draw proposes one vector per block; the codeword actually written is
-// the stored motion field closest to that proposal, so the blocks stay on
-// a field the codec produced. The residual is empty, so each pixel is the
-// color its vector points at. The three channels move together.
+// Each cell keeps the velocity of its centroid over the last eight frames.
+// A stored motion field from another moment shears the cells that are on
+// screen now, so the forecast does not reuse one. The vectors written are
+// the ones the decompressor warps with, and the residual is empty, so the
+// three channels move together.
 func Predict(blob []byte) ([half][pixels]rgb, error) {
 	var out [half][pixels]rgb
 	raw, err := Decompress(blob)
@@ -190,67 +195,31 @@ func Predict(blob []byte) ([half][pixels]rgb, error) {
 	if err != nil {
 		return out, err
 	}
-	trans, marg, fields := learnMotion(&pix)
-	state := fields[len(fields)-1]
 	cur := pix[frames-1]
-	rng := lcg(1)
+	bodies := components(&cur)
+	assignSpeed(bodies, components(&pix[frames-1-trackLag]), trackLag)
 	for f := range out {
-		var prop [nBlock][2]int
-		for b := range prop {
-			id := vectorID(state[b][0], state[b][1])
-			id = draw(&rng, &trans[id], &marg)
-			prop[b][0], prop[b][1] = idVector(id)
+		for i := range bodies {
+			bodies[i].tx += bodies[i].sx
+			bodies[i].ty += bodies[i].sy
+			bodies[i].vx = clampMV(iround(bodies[i].tx))
+			bodies[i].vy = clampMV(iround(bodies[i].ty))
 		}
-		mv := nearestField(fields, prop)
-		next, err := stepCompressed(&cur, mv)
+		next, err := stepCompressed(&cur, fieldOf(bodies))
 		if err != nil {
 			return out, err
 		}
+		grown := components(&next)
+		carrySpeed(grown, bodies)
+		for i := range grown {
+			grown[i].tx -= float64(grown[i].vx)
+			grown[i].ty -= float64(grown[i].vy)
+		}
 		out[f] = next
 		cur = next
-		state = mv
+		bodies = grown
 	}
 	return out, nil
-}
-
-func learnMotion(pix *[frames][pixels]rgb) ([nVecSym][nVecSym]int, [nVecSym]int, [][nBlock][2]int) {
-	var trans [nVecSym][nVecSym]int
-	var marg [nVecSym]int
-	fields := make([][nBlock][2]int, 0, frames-1)
-	var prev [nBlock]int
-	seen := false
-	for f := 1; f < frames; f++ {
-		mv := searchMV(&pix[f-1], &pix[f])
-		fields = append(fields, mv)
-		for b, v := range mv {
-			id := vectorID(v[0], v[1])
-			marg[id]++
-			if seen {
-				trans[prev[b]][id]++
-			}
-			prev[b] = id
-		}
-		seen = true
-	}
-	return trans, marg, fields
-}
-
-func nearestField(fields [][nBlock][2]int, prop [nBlock][2]int) [nBlock][2]int {
-	best := 0
-	bestH, bestL := nBlock+1, 0
-	for i, f := range fields {
-		h, l := 0, 0
-		for b := range f {
-			if f[b] != prop[b] {
-				h++
-			}
-			l += iabs(f[b][0]-prop[b][0]) + iabs(f[b][1]-prop[b][1])
-		}
-		if h < bestH || (h == bestH && l < bestL) {
-			bestH, bestL, best = h, l, i
-		}
-	}
-	return fields[best]
 }
 
 func stepCompressed(cur *[pixels]rgb, mv [nBlock][2]int) ([pixels]rgb, error) {
@@ -274,48 +243,149 @@ func stepCompressed(cur *[pixels]rgb, mv [nBlock][2]int) ([pixels]rgb, error) {
 	return warp(cur, got), nil
 }
 
-func vectorID(dx, dy int) int {
-	span := 2*mvRange + 1
-	return (dy+mvRange)*span + (dx + mvRange)
+// A body is one bright connected cell. sx, sy is its centroid velocity in
+// pixels per frame. tx, ty is the fraction of that velocity not yet written
+// as a motion vector.
+type body struct {
+	pix    []int
+	cx, cy float64
+	sx, sy float64
+	tx, ty float64
+	vx, vy int
 }
 
-func idVector(id int) (int, int) {
-	span := 2*mvRange + 1
-	return id%span - mvRange, id/span - mvRange
-}
-
-// lcg is the fixed generator for the forecast. The multiplier is the
-// Numerical Recipes constant; the low bits are not used.
-type lcg uint64
-
-func (r *lcg) next() uint32 {
-	*r = *r*1664525 + 1013904223
-	return uint32(*r >> 32)
-}
-
-func draw(r *lcg, row *[nVecSym]int, marg *[nVecSym]int) int {
-	counts := row[:]
-	total := 0
-	for _, c := range counts {
-		total += c
+func components(f *[pixels]rgb) []body {
+	var seen [pixels]bool
+	var out []body
+	for p := range pixels {
+		if seen[p] || luma(f[p]) <= 1 {
+			continue
+		}
+		pixs := []int{}
+		q := []int{p}
+		seen[p] = true
+		for len(q) > 0 {
+			i := q[len(q)-1]
+			q = q[:len(q)-1]
+			pixs = append(pixs, i)
+			x, y := i%width, i/width
+			for _, d := range [][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}} {
+				nx, ny := x+d[0], y+d[1]
+				if uint(nx) >= width || uint(ny) >= height {
+					continue
+				}
+				j := ny*width + nx
+				if seen[j] || luma(f[j]) <= 1 {
+					continue
+				}
+				seen[j] = true
+				q = append(q, j)
+			}
+		}
+		sx, sy := 0, 0
+		for _, i := range pixs {
+			sx += i % width
+			sy += i / width
+		}
+		n := float64(len(pixs))
+		out = append(out, body{pix: pixs, cx: float64(sx) / n, cy: float64(sy) / n})
 	}
-	if total == 0 {
-		counts = marg[:]
-		for _, c := range counts {
-			total += c
+	return out
+}
+
+func assignSpeed(dst, src []body, lag int) {
+	used := make([]bool, len(src))
+	for i := range dst {
+		if len(dst[i].pix) < cellMin {
+			continue
+		}
+		best, bestd := -1, 1e9
+		for j := range src {
+			if used[j] || len(src[j].pix) < cellMin {
+				continue
+			}
+			dx := dst[i].cx - src[j].cx
+			dy := dst[i].cy - src[j].cy
+			d := dx*dx + dy*dy
+			if d < bestd {
+				bestd, best = d, j
+			}
+		}
+		if best < 0 || bestd > 64 {
+			continue
+		}
+		used[best] = true
+		dst[i].sx = (dst[i].cx - src[best].cx) / float64(lag)
+		dst[i].sy = (dst[i].cy - src[best].cy) / float64(lag)
+	}
+}
+
+func carrySpeed(dst, src []body) {
+	used := make([]bool, len(src))
+	for i := range dst {
+		best, bestd := -1, 1e9
+		for j := range src {
+			if used[j] {
+				continue
+			}
+			dx := dst[i].cx - src[j].cx
+			dy := dst[i].cy - src[j].cy
+			d := dx*dx + dy*dy
+			if d < bestd {
+				bestd, best = d, j
+			}
+		}
+		if best < 0 || bestd > 36 {
+			continue
+		}
+		used[best] = true
+		dst[i].sx, dst[i].sy = src[best].sx, src[best].sy
+		dst[i].tx, dst[i].ty = src[best].tx, src[best].ty
+		dst[i].vx, dst[i].vy = src[best].vx, src[best].vy
+	}
+}
+
+func fieldOf(cs []body) [nBlock][2]int {
+	var bestN [nBlock]int
+	var out [nBlock][2]int
+	for _, c := range cs {
+		if c.vx == 0 && c.vy == 0 {
+			continue
+		}
+		cover := map[int]int{}
+		for _, p := range c.pix {
+			x, y := p%width, p/width
+			cover[(y/block)*grid+x/block]++
+			nx, ny := x+c.vx, y+c.vy
+			if uint(nx) < width && uint(ny) < height {
+				cover[(ny/block)*grid+nx/block]++
+			}
+		}
+		for b, n := range cover {
+			if n > bestN[b] {
+				bestN[b] = n
+				out[b] = [2]int{c.vx, c.vy}
+			}
 		}
 	}
-	if total == 0 {
-		return vectorID(0, 0)
+	return out
+}
+
+func clampMV(n int) int {
+	if n > mvRange {
+		return mvRange
 	}
-	u := int(r.next() % uint32(total))
-	for i, c := range counts {
-		u -= c
-		if u < 0 {
-			return i
-		}
+	if n < -mvRange {
+		return -mvRange
 	}
-	return vectorID(0, 0)
+	return n
+}
+
+func iround(x float64) int {
+	if x >= 0 {
+		return int(x + 0.5)
+	}
+	return int(x - 0.5)
 }
 
 // Decompress restores the exact file bytes written by Compress.
