@@ -6,31 +6,12 @@ package main
 
 import (
 	"bytes"
+	"image"
 	"image/gif"
 	"os"
 	"path/filepath"
 	"testing"
 )
-
-func TestStayCodes(t *testing.T) {
-	for ctx := range stayModel {
-		for _, pair := range stayModel[ctx] {
-			sym := int(pair[0])
-			var w bits
-			if err := w.writeStay(ctx, sym); err != nil {
-				t.Fatal(err)
-			}
-			r := reader{b: w.finish()}
-			got, err := r.readStay(ctx)
-			if err != nil || got != sym {
-				t.Fatalf("ctx %d sym %d got %d err %v", ctx, sym, got, err)
-			}
-			if err := r.done(); err != nil {
-				t.Fatalf("ctx %d sym %d tail: %v", ctx, sym, err)
-			}
-		}
-	}
-}
 
 func TestRoundTrip(t *testing.T) {
 	original, err := os.ReadFile("cell.csv")
@@ -41,15 +22,15 @@ func TestRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(compressed) != CompressedSize {
-		t.Fatalf("compressed %d bytes, want %d", len(compressed), CompressedSize)
-	}
 	got, err := Decompress(compressed)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(got, original) {
 		t.Fatal("round trip mismatch")
+	}
+	if len(compressed) != CompressedSize {
+		t.Fatalf("compressed %d bytes, want %d", len(compressed), CompressedSize)
 	}
 	t.Logf("cell.csv: %d -> %d bytes", len(original), len(compressed))
 }
@@ -90,14 +71,14 @@ func TestPredict(t *testing.T) {
 	}
 	bright := 0
 	for _, v := range future[half-1] {
-		if v > 1 {
+		if luma(v) > 1 {
 			bright++
 		}
 	}
 	if bright < 40 {
 		t.Fatalf("cells faded: %d bright pixels", bright)
 	}
-	clip := make([][pixels]byte, 0, frames+half)
+	clip := make([][pixels]rgb, 0, frames+half)
 	for f := range pix {
 		clip = append(clip, pix[f])
 	}
@@ -121,11 +102,13 @@ func TestPredict(t *testing.T) {
 	if g.Image[0].Bounds().Dx() != width*gifScale || g.Image[0].Bounds().Dy() != height*gifScale {
 		t.Fatalf("gif size %v", g.Image[0].Bounds())
 	}
-	check := func(frame, x, y int, want byte) {
+	check := func(frame, x, y int, want rgb) {
 		t.Helper()
-		got := g.Image[frame].ColorIndexAt(x*gifScale, y*gifScale)
-		if got != want {
-			t.Fatalf("frame %d pixel %d,%d = %d, want %d", frame, x, y, got, want)
+		if got := gifRGB(g.Image[frame], x*gifScale, y*gifScale); got != want {
+			t.Fatalf("frame %d pixel %d,%d = %v, want %v", frame, x, y, got, want)
+		}
+		if got := gifRGB(g.Image[frame], x*gifScale+gifScale-1, y*gifScale+gifScale-1); got != want {
+			t.Fatalf("frame %d pixel %d,%d scale edge = %v, want %v", frame, x, y, got, want)
 		}
 	}
 	check(0, 0, 0, pix[0][0])
@@ -136,6 +119,11 @@ func TestPredict(t *testing.T) {
 			t.Fatalf("delay %d", d)
 		}
 	}
+}
+
+func gifRGB(img image.Image, x, y int) rgb {
+	r, g, b, _ := img.At(x, y).RGBA()
+	return rgb{byte(r >> 8), byte(g >> 8), byte(b >> 8)}
 }
 
 func TestRejects(t *testing.T) {
@@ -165,11 +153,10 @@ func TestRejects(t *testing.T) {
 		t.Fatalf("truncated file: %v", err)
 	}
 	lines := bytes.Split(bytes.TrimSuffix(original, []byte("\n")), []byte("\n"))
-	lines[1] = setLevel(lines[1], "0")
-	lines[1+half] = setLevel(lines[1+half], "2")
+	lines[1] = setLevel(lines[1], "00")
 	broken := append(bytes.Join(lines, []byte("\n")), '\n')
 	if _, err := Compress(broken); err != ErrFormat {
-		t.Fatalf("level step: %v", err)
+		t.Fatalf("canonical: %v", err)
 	}
 }
 

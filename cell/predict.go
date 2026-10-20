@@ -49,7 +49,7 @@ func forecast(args []string) error {
 	if err != nil {
 		return err
 	}
-	clip := make([][pixels]byte, 0, frames+half)
+	clip := make([][pixels]rgb, 0, frames+half)
 	for f := range pix {
 		clip = append(clip, pix[f])
 	}
@@ -61,29 +61,18 @@ func forecast(args []string) error {
 	return nil
 }
 
-func writeGIF(path string, frames [][pixels]byte) error {
-	pal := make(color.Palette, 256)
-	for i := range pal {
-		pal[i] = color.Gray{Y: uint8(i)}
-	}
-	g := &gif.GIF{
-		LoopCount: 0,
-		Config: image.Config{
-			ColorModel: pal,
-			Width:      width * gifScale,
-			Height:     height * gifScale,
-		},
-	}
-	for f := range frames {
-		img := image.NewPaletted(image.Rect(0, 0, width*gifScale, height*gifScale), pal)
-		for y := range height {
-			for x := range width {
-				c := frames[f][y*width+x]
-				for dy := range gifScale {
-					for dx := range gifScale {
-						img.SetColorIndex(x*gifScale+dx, y*gifScale+dy, c)
-					}
-				}
+func writeGIF(path string, clip [][pixels]rgb) error {
+	g := &gif.GIF{LoopCount: 0}
+	for f := range clip {
+		img, err := palettedFrame(&clip[f])
+		if err != nil {
+			return err
+		}
+		if f == 0 {
+			g.Config = image.Config{
+				ColorModel: img.Palette,
+				Width:      width * gifScale,
+				Height:     height * gifScale,
 			}
 		}
 		g.Image = append(g.Image, img)
@@ -98,4 +87,34 @@ func writeGIF(path string, frames [][pixels]byte) error {
 		return err
 	}
 	return out.Close()
+}
+
+// palettedFrame builds a local palette. A warped frame only copies colors
+// from the previous one, and no source frame of this clip exceeds 256.
+func palettedFrame(frame *[pixels]rgb) (*image.Paletted, error) {
+	index := make(map[rgb]uint8, 256)
+	pal := make(color.Palette, 0, 256)
+	for p := range frame {
+		c := frame[p]
+		if _, ok := index[c]; ok {
+			continue
+		}
+		if len(pal) == 256 {
+			return nil, fmt.Errorf("cell: frame has more than 256 colors")
+		}
+		index[c] = uint8(len(pal))
+		pal = append(pal, color.RGBA{R: c[0], G: c[1], B: c[2], A: 255})
+	}
+	img := image.NewPaletted(image.Rect(0, 0, width*gifScale, height*gifScale), pal)
+	for y := range height {
+		for x := range width {
+			c := index[frame[y*width+x]]
+			for dy := range gifScale {
+				for dx := range gifScale {
+					img.SetColorIndex(x*gifScale+dx, y*gifScale+dy, c)
+				}
+			}
+		}
+	}
+	return img, nil
 }

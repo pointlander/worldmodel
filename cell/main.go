@@ -4,9 +4,9 @@
 
 // Command cell writes one CSV row per video frame.
 //
-// ffmpeg decodes the video, scales every frame to 32x32, then converts
-// that frame to grayscale. Each row is the frame time in seconds followed
-// by the 1024 intensities in row-major order.
+// ffmpeg decodes the video and scales every frame to 32x32 color. Each row
+// is the frame time in seconds followed by the red, green, and blue sample
+// of every pixel in row-major order.
 //
 // cell predict writes the original frames, then 33 future frames, as a GIF.
 // A Markov chain on the clip's motion codes supplies the compressed vectors,
@@ -27,9 +27,10 @@ import (
 )
 
 const (
-	width  = 32
-	height = 32
-	frame  = width * height
+	width    = 32
+	height   = 32
+	channels = 3
+	frame    = width * height
 )
 
 var ptsTime = regexp.MustCompile(`n:\s*\d+\s+pts:\s*\S+\s+pts_time:([0-9.]+)`)
@@ -86,17 +87,17 @@ func videoPath(args []string) (string, error) {
 	return "", errors.New("no mp4 file")
 }
 
-// framesOf asks ffmpeg for raw gray frames. The scale filter runs before
-// format=gray, so the grayscale values are the 32x32 picture.
+// framesOf asks ffmpeg for raw rgb24 frames. The scale filter runs before
+// format=rgb24, so the samples are the 32x32 picture.
 func framesOf(video string) (times []string, frames [][]byte, err error) {
 	cmd := exec.Command("ffmpeg",
 		"-hide_banner",
 		"-nostats",
 		"-i", video,
-		"-vf", "scale=32:32:flags=lanczos,format=gray,showinfo",
+		"-vf", "scale=32:32:flags=lanczos,format=rgb24,showinfo",
 		"-fps_mode", "passthrough",
 		"-f", "rawvideo",
-		"-pix_fmt", "gray",
+		"-pix_fmt", "rgb24",
 		"pipe:1",
 	)
 	stdout, err := cmd.StdoutPipe()
@@ -131,19 +132,20 @@ func framesOf(video string) (times []string, frames [][]byte, err error) {
 		}
 		return nil, nil, fmt.Errorf("ffmpeg: %w\n%s", waitErr, msg)
 	}
-	if len(raw)%frame != 0 {
-		return nil, nil, fmt.Errorf("ffmpeg wrote %d bytes, not a whole number of %d-byte frames", len(raw), frame)
+	rawFrame := frame * channels
+	if len(raw)%rawFrame != 0 {
+		return nil, nil, fmt.Errorf("ffmpeg wrote %d bytes, not a whole number of %d-byte frames", len(raw), rawFrame)
 	}
 	for _, m := range ptsTime.FindAllStringSubmatch(log.String(), -1) {
 		times = append(times, m[1])
 	}
-	n := len(raw) / frame
+	n := len(raw) / rawFrame
 	if len(times) != n {
 		return nil, nil, fmt.Errorf("ffmpeg reported %d timestamps for %d frames", len(times), n)
 	}
 	frames = make([][]byte, n)
 	for i := range frames {
-		frames[i] = raw[i*frame : (i+1)*frame]
+		frames[i] = raw[i*rawFrame : (i+1)*rawFrame]
 	}
 	return times, frames, nil
 }
@@ -154,11 +156,15 @@ func writeCSV(path string, times []string, frames [][]byte) error {
 		return err
 	}
 	w := csv.NewWriter(f)
-	header := make([]string, 1+frame)
+	header := make([]string, 1+frame*channels)
 	header[0] = "time"
+	i := 1
 	for y := 0; y < height; y++ {
 		for x := 0; x < width; x++ {
-			header[1+y*width+x] = fmt.Sprintf("r%dc%d", y, x)
+			for c := 0; c < channels; c++ {
+				header[i] = pixelName(y, x, c)
+				i++
+			}
 		}
 	}
 	if err := w.Write(header); err != nil {

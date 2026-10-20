@@ -22,36 +22,51 @@ const (
 	grid    = width / block
 	nBlock  = grid * (height / block)
 	mvRange = 2
-	kBright = 2
-	kXor    = 5
-	kOnes   = 4
-	kValue  = 5
-	kNew    = 3
 	kMove   = 0
-	kCorr   = 5
+)
+
+// Gap and value Rice parameters, one entry per channel. The order is red,
+// green, blue. Encode and decode use these same constants; they are not
+// written into the blob.
+var (
+	kGap0   = [channels]int{2, 2, 1}
+	kVal0   = [channels]int{6, 4, 5}
+	kGapM   = [channels]int{2, 2, 1}
+	kDelta  = [channels]int{5, 4, 4}
+	kGapH   = [channels]int{5, 5, 4}
+	kDeltaH = [channels]int{1, 1, 1}
 )
 
 // CompressedSize is the length of the blob for the canonical cell.csv.
-// 42354 bits is the motion coding with lifting details on the stay residuals.
-const CompressedSize = 5295
+// 204669 bits is the shared-luma motion coding with one residual stream per channel.
+const CompressedSize = 25584
 
 // ErrFormat reports an input that is not the canonical cell clip or a blob
 // this model can decode.
 var ErrFormat = errors.New("cell: invalid data")
 
-// The clip is 66 frames at four per second, so the header and the time
-// column are fixed. The second half repeats the first, except at pixels
-// that differ by one.
+// bg is the flat field frame 0 is coded against. Blue's mode on this clip is 1.
+var bg = rgb{0, 0, 1}
+
+// The clip is 66 color frames at four per second, so the header and the time
+// column are fixed. Motion is one field for every channel: each 8x8 block is
+// a translation of the previous frame by at most two pixels, chosen by the
+// integer luma of the block. A zero vector is one bit; any other vector is a
+// zigzag Rice pair. The sample under (x, y) is the previous pixel at
+// (x-dx, y-dy). Off-frame samples are black, which is not the background.
 //
-// Inside the first half, each 8x8 block is a translation of the previous
-// frame by at most two pixels. A zero vector is one bit; any other vector
-// is a zigzag Rice pair. Pixels whose brightness the translation gets wrong
-// are a gap-Rice correction of the bright mask. A translated bright pixel
-// stores the detail of a causal lifting step around the average of the stay
-// residuals already coded above and to the left. Sixteen contexts, from the
-// absolute size of those neighbors, each have a fixed canonical code. A newly
-// bright pixel stores its level above 1. Ones stay an absolute gap-Rice mask.
-// Decompress applies those same translations and details.
+// Frame 0 stores the samples that differ from the background. Each later base
+// frame stores the samples that differ from the motion prediction. The second
+// half stores the samples that differ from the first. A difference is a gap
+// into the scan and a zigzag Rice residual. The three channels are separate
+// streams and share the motion field.
+
+type rgb [channels]byte
+
+type plane struct {
+	pos []int
+	val []int
+}
 
 var head string
 
@@ -60,10 +75,17 @@ func init() {
 	b.WriteString("time")
 	for y := range height {
 		for x := range width {
-			fmt.Fprintf(&b, ",r%dc%d", y, x)
+			for c := range channels {
+				b.WriteByte(',')
+				b.WriteString(pixelName(y, x, c))
+			}
 		}
 	}
 	head = b.String()
+}
+
+func pixelName(y, x, c int) string {
+	return fmt.Sprintf("r%dc%d%c", y, x, "rgb"[c])
 }
 
 // Compress packs a canonical cell.csv into its fixed-parameter motion coding.
@@ -72,63 +94,80 @@ func Compress(src []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	var bright0, ones, corr, signs []int
-	var values0 []int
-	for f := range half {
+	var f0, mis, corr [channels]plane
+	for c := range channels {
 		for p := range pixels {
-			v := int(pix[f][p])
-			if f == 0 && v > 1 {
-				bright0 = append(bright0, p)
-				values0 = append(values0, v-2)
-			}
-			if v == 1 {
-				ones = append(ones, f*pixels+p)
-			}
-			d := int(pix[f+half][p]) - v
-			switch d {
-			case 0:
-			case -1:
-				corr = append(corr, f*pixels+p)
-				signs = append(signs, 0)
-			case 1:
-				corr = append(corr, f*pixels+p)
-				signs = append(signs, 1)
-			default:
-				return nil, ErrFormat
+			if pix[0][p][c] != bg[c] {
+				f0[c].pos = append(f0[c].pos, p)
+				f0[c].val = append(f0[c].val, int(pix[0][p][c]))
 			}
 		}
 	}
-	vecs, xors, levels := motionOf(&pix)
+	vecs := motionVecs(&pix)
+	for f := 1; f < half; f++ {
+		pred := warp(&pix[f-1], vecs[f-1])
+		for p := range pixels {
+			for c := range channels {
+				d := int(pix[f][p][c]) - int(pred[p][c])
+				if d == 0 {
+					continue
+				}
+				mis[c].pos = append(mis[c].pos, (f-1)*pixels+p)
+				mis[c].val = append(mis[c].val, d)
+			}
+		}
+	}
+	for f := range half {
+		for p := range pixels {
+			for c := range channels {
+				d := int(pix[f+half][p][c]) - int(pix[f][p][c])
+				if d == 0 {
+					continue
+				}
+				corr[c].pos = append(corr[c].pos, f*pixels+p)
+				corr[c].val = append(corr[c].val, d)
+			}
+		}
+	}
 	var w bits
-	w.bits(len(bright0), 16)
-	w.bits(len(xors), 16)
-	w.bits(len(ones), 16)
-	w.bits(len(corr), 16)
-	writeGaps(&w, bright0, kBright)
-	for _, v := range values0 {
-		w.rice(v, kValue)
+	for c := range channels {
+		w.bits(len(f0[c].pos), 16)
+	}
+	for c := range channels {
+		w.bits(len(mis[c].pos), 16)
+	}
+	for c := range channels {
+		w.bits(len(corr[c].pos), 16)
+	}
+	for c := range channels {
+		writeAbs(&w, &f0[c], kGap0[c], kVal0[c])
 	}
 	for f := range vecs {
 		for _, mv := range vecs[f] {
 			w.vector(mv[0], mv[1])
 		}
 	}
-	writeGaps(&w, xors, kXor)
-	for _, lv := range levels {
-		if lv.stay {
-			if err := w.writeStay(lv.ctx, lv.sym); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		w.rice(lv.sym, lv.k)
+	for c := range channels {
+		writeDelta(&w, &mis[c], kGapM[c], kDelta[c])
 	}
-	writeGaps(&w, ones, kOnes)
-	writeGaps(&w, corr, kCorr)
-	for _, s := range signs {
-		w.bit(s)
+	for c := range channels {
+		writeDelta(&w, &corr[c], kGapH[c], kDeltaH[c])
 	}
 	return w.finish(), nil
+}
+
+func writeAbs(w *bits, p *plane, kPos, kVal int) {
+	writeGaps(w, p.pos, kPos)
+	for _, v := range p.val {
+		w.rice(v, kVal)
+	}
+}
+
+func writeDelta(w *bits, p *plane, kPos, kVal int) {
+	writeGaps(w, p.pos, kPos)
+	for _, v := range p.val {
+		w.rice(zig(v), kVal)
+	}
 }
 
 // nVecSym is the number of motion vectors the codec can write.
@@ -139,11 +178,10 @@ const nVecSym = (2*mvRange + 1) * (2*mvRange + 1)
 // Each block's motion vector is a Markov chain learned from the clip.
 // A draw proposes one vector per block; the codeword actually written is
 // the stored motion field closest to that proposal, so the blocks stay on
-// a field the codec produced. Those vectors, and a stay code that
-// reconstructs a zero residual at every bright sample, are what the
-// decompressor reads back. A pixel becomes the sample its vector points at.
-func Predict(blob []byte) ([half][pixels]byte, error) {
-	var out [half][pixels]byte
+// a field the codec produced. The residual is empty, so each pixel is the
+// color its vector points at. The three channels move together.
+func Predict(blob []byte) ([half][pixels]rgb, error) {
+	var out [half][pixels]rgb
 	raw, err := Decompress(blob)
 	if err != nil {
 		return out, err
@@ -175,7 +213,7 @@ func Predict(blob []byte) ([half][pixels]byte, error) {
 	return out, nil
 }
 
-func learnMotion(pix *[frames][pixels]byte) ([nVecSym][nVecSym]int, [nVecSym]int, [][nBlock][2]int) {
+func learnMotion(pix *[frames][pixels]rgb) ([nVecSym][nVecSym]int, [nVecSym]int, [][nBlock][2]int) {
 	var trans [nVecSym][nVecSym]int
 	var marg [nVecSym]int
 	fields := make([][nBlock][2]int, 0, frames-1)
@@ -215,25 +253,11 @@ func nearestField(fields [][nBlock][2]int, prop [nBlock][2]int) [nBlock][2]int {
 	return fields[best]
 }
 
-func stepCompressed(cur *[pixels]byte, mv [nBlock][2]int) ([pixels]byte, error) {
-	var next [pixels]byte
+func stepCompressed(cur *[pixels]rgb, mv [nBlock][2]int) ([pixels]rgb, error) {
+	var next [pixels]rgb
 	var w bits
 	for _, v := range mv {
 		w.vector(v[0], v[1])
-	}
-	var pred [pixels]byte
-	var isStay [pixels]bool
-	var resid [pixels]int
-	for p := range pred {
-		pred[p] = predAt(cur, mv, p)
-		if pred[p] <= 1 {
-			continue
-		}
-		hat, ctx := stayPredict(&isStay, &resid, p)
-		if err := w.writeStay(ctx, zig(-hat)); err != nil {
-			return next, err
-		}
-		isStay[p] = true
 	}
 	r := reader{b: w.finish()}
 	var got [nBlock][2]int
@@ -244,31 +268,10 @@ func stepCompressed(cur *[pixels]byte, mv [nBlock][2]int) ([pixels]byte, error) 
 		}
 		got[b] = [2]int{dx, dy}
 	}
-	var gotStay [pixels]bool
-	var gotResid [pixels]int
-	for p := range next {
-		pr := predAt(cur, got, p)
-		if pr <= 1 {
-			next[p] = pr
-			continue
-		}
-		hat, ctx := stayPredict(&gotStay, &gotResid, p)
-		sym, err := r.readStay(ctx)
-		if err != nil {
-			return next, err
-		}
-		v := int(pr) + hat + unzig(sym)
-		if v < 2 || v > 255 {
-			return next, ErrFormat
-		}
-		gotResid[p] = v - int(pr)
-		gotStay[p] = true
-		next[p] = byte(v)
-	}
 	if err := r.done(); err != nil {
 		return next, err
 	}
-	return next, nil
+	return warp(cur, got), nil
 }
 
 func vectorID(dx, dy int) int {
@@ -318,36 +321,36 @@ func draw(r *lcg, row *[nVecSym]int, marg *[nVecSym]int) int {
 // Decompress restores the exact file bytes written by Compress.
 func Decompress(src []byte) ([]byte, error) {
 	r := reader{b: src}
-	nBright, err := r.bits(16)
-	if err != nil {
-		return nil, err
-	}
-	nXor, err := r.bits(16)
-	if err != nil {
-		return nil, err
-	}
-	nOnes, err := r.bits(16)
-	if err != nil {
-		return nil, err
-	}
-	nCorr, err := r.bits(16)
-	if err != nil {
-		return nil, err
-	}
-	bright0, err := readGaps(&r, nBright, kBright, pixels)
-	if err != nil {
-		return nil, err
-	}
-	var pix [frames][pixels]byte
-	for _, p := range bright0 {
-		v, err := r.rice(kValue)
+	var n0, nMis, nHalf [channels]int
+	for c := range n0 {
+		n, err := r.bits(16)
 		if err != nil {
 			return nil, err
 		}
-		if v > 253 {
-			return nil, ErrFormat
+		n0[c] = n
+	}
+	for c := range nMis {
+		n, err := r.bits(16)
+		if err != nil {
+			return nil, err
 		}
-		pix[0][p] = byte(v + 2)
+		nMis[c] = n
+	}
+	for c := range nHalf {
+		n, err := r.bits(16)
+		if err != nil {
+			return nil, err
+		}
+		nHalf[c] = n
+	}
+	var pix [frames][pixels]rgb
+	for p := range pix[0] {
+		pix[0][p] = bg
+	}
+	for c := range channels {
+		if err := readAbs(&r, &pix[0], c, n0[c], kGap0[c], kVal0[c]); err != nil {
+			return nil, err
+		}
 	}
 	var vecs [half - 1][nBlock][2]int
 	for f := range vecs {
@@ -359,88 +362,42 @@ func Decompress(src []byte) ([]byte, error) {
 			vecs[f][b] = [2]int{dx, dy}
 		}
 	}
-	xors, err := readGaps(&r, nXor, kXor, motionN)
-	if err != nil {
-		return nil, err
+	var mis [channels][]hit
+	for c := range channels {
+		hits, err := readHits(&r, nMis[c], kGapM[c], kDelta[c], motionN)
+		if err != nil {
+			return nil, err
+		}
+		mis[c] = hits
 	}
-	xi := 0
+	// Each prediction is taken from the frame after its residuals are applied.
+	var at [channels]int
 	for dest := 1; dest < half; dest++ {
-		var pred [pixels]byte
-		var bright [pixels]bool
-		for p := range pixels {
-			pred[p] = predAt(&pix[dest-1], vecs[dest-1], p)
-			bright[p] = pred[p] > 1
-		}
-		for xi < len(xors) && xors[xi]/pixels == dest-1 {
-			p := xors[xi] % pixels
-			bright[p] = !bright[p]
-			xi++
-		}
-		var isStay [pixels]bool
-		var resid [pixels]int
-		for p := range pixels {
-			if !bright[p] {
-				continue
-			}
-			if pred[p] <= 1 {
-				v, err := r.level(pred[p])
+		pix[dest] = warp(&pix[dest-1], vecs[dest-1])
+		for c := range channels {
+			for at[c] < len(mis[c]) && mis[c][at[c]].pos/pixels == dest-1 {
+				h := mis[c][at[c]]
+				v, err := addChan(pix[dest][h.pos%pixels][c], h.d)
 				if err != nil {
 					return nil, err
 				}
-				pix[dest][p] = byte(v)
-				continue
+				pix[dest][h.pos%pixels][c] = v
+				at[c]++
 			}
-			hat, ctx := stayPredict(&isStay, &resid, p)
-			sym, err := r.readStay(ctx)
-			if err != nil {
-				return nil, err
-			}
-			v := int(pred[p]) + hat + unzig(sym)
-			if v < 2 || v > 255 {
-				return nil, ErrFormat
-			}
-			resid[p] = v - int(pred[p])
-			isStay[p] = true
-			pix[dest][p] = byte(v)
 		}
 	}
-	if xi != len(xors) {
-		return nil, ErrFormat
-	}
-	ones, err := readGaps(&r, nOnes, kOnes, baseN)
-	if err != nil {
-		return nil, err
-	}
-	for _, i := range ones {
-		f, p := i/pixels, i%pixels
-		if pix[f][p] != 0 {
+	for c := range channels {
+		if at[c] != len(mis[c]) {
 			return nil, ErrFormat
 		}
-		pix[f][p] = 1
-	}
-	corr, err := readGaps(&r, nCorr, kCorr, baseN)
-	if err != nil {
-		return nil, err
 	}
 	for f := range half {
 		pix[f+half] = pix[f]
 	}
-	for _, i := range corr {
-		s, err := r.bit()
-		if err != nil {
+	for c := range channels {
+		if err := readDelta(&r, &pix, c, nHalf[c], kGapH[c], kDeltaH[c], half, baseN); err != nil {
 			return nil, err
 		}
-		f, p := i/pixels, i%pixels
-		v := int(pix[f][p])
-		if s == 0 {
-			v--
-		} else {
-			v++
-		}
-		if v < 0 || v > 255 {
-			return nil, ErrFormat
-		}
-		pix[f+half][p] = byte(v)
 	}
 	if err := r.done(); err != nil {
 		return nil, err
@@ -448,63 +405,117 @@ func Decompress(src []byte) ([]byte, error) {
 	return format(pix), nil
 }
 
-// A coded level is a new bright pixel, stored as a Rice value above 1, or
-// the zigzag detail of a stay residual.
-type codedLevel struct {
-	stay bool
-	k    int
-	sym  int
-	ctx  int
+func readAbs(r *reader, frame *[pixels]rgb, c, count, kPos, kVal int) error {
+	pos, err := readGaps(r, count, kPos, pixels)
+	if err != nil {
+		return err
+	}
+	for _, p := range pos {
+		v, err := r.rice(kVal)
+		if err != nil {
+			return err
+		}
+		if v > 255 {
+			return ErrFormat
+		}
+		frame[p][c] = byte(v)
+	}
+	return nil
 }
 
-func motionOf(pix *[frames][pixels]byte) ([half - 1][nBlock][2]int, []int, []codedLevel) {
+type hit struct {
+	pos int
+	d   int
+}
+
+func readHits(r *reader, count, kPos, kVal, limit int) ([]hit, error) {
+	pos, err := readGaps(r, count, kPos, limit)
+	if err != nil {
+		return nil, err
+	}
+	hits := make([]hit, count)
+	for i, p := range pos {
+		d, err := r.signed(kVal)
+		if err != nil {
+			return nil, err
+		}
+		hits[i] = hit{pos: p, d: d}
+	}
+	return hits, nil
+}
+
+// readDelta adds zigzag residuals. origin is the frame index of scan position
+// 0, so a second-half residual uses half.
+func readDelta(r *reader, pix *[frames][pixels]rgb, c, count, kPos, kVal, origin, limit int) error {
+	pos, err := readGaps(r, count, kPos, limit)
+	if err != nil {
+		return err
+	}
+	for _, i := range pos {
+		d, err := r.signed(kVal)
+		if err != nil {
+			return err
+		}
+		f := i/pixels + origin
+		p := i % pixels
+		if f < 0 || f >= frames {
+			return ErrFormat
+		}
+		v, err := addChan(pix[f][p][c], d)
+		if err != nil {
+			return err
+		}
+		pix[f][p][c] = v
+	}
+	return nil
+}
+
+func addChan(v byte, d int) (byte, error) {
+	n := int(v) + d
+	if uint(n) > 255 {
+		return 0, ErrFormat
+	}
+	return byte(n), nil
+}
+
+func motionVecs(pix *[frames][pixels]rgb) [half - 1][nBlock][2]int {
 	var vecs [half - 1][nBlock][2]int
-	var xors []int
-	var levels []codedLevel
 	for f := 1; f < half; f++ {
 		vecs[f-1] = searchMV(&pix[f-1], &pix[f])
-		var isStay [pixels]bool
-		var resid [pixels]int
-		for p := range pixels {
-			pred := predAt(&pix[f-1], vecs[f-1], p)
-			cur := pix[f][p]
-			if (pred > 1) != (cur > 1) {
-				xors = append(xors, (f-1)*pixels+p)
-			}
-			if cur <= 1 {
-				continue
-			}
-			if pred <= 1 {
-				levels = append(levels, codedLevel{k: kNew, sym: int(cur) - 2})
-				continue
-			}
-			hat, ctx := stayPredict(&isStay, &resid, p)
-			lv := int(cur) - int(pred)
-			levels = append(levels, codedLevel{stay: true, sym: zig(lv - hat), ctx: ctx})
-			resid[p] = lv
-			isStay[p] = true
-		}
 	}
-	return vecs, xors, levels
+	return vecs
 }
 
 // (dx, dy) is how far the block moved. The sample under (x, y) is the
 // previous pixel at (x-dx, y-dy); off-frame samples are black.
-func predAt(src *[pixels]byte, vecs [nBlock][2]int, p int) byte {
+func predAt(src *[pixels]rgb, vecs [nBlock][2]int, p int) rgb {
 	y, x := p/width, p%width
 	b := (y/block)*grid + x/block
 	dx, dy := vecs[b][0], vecs[b][1]
 	return sample(src, x-dx, y-dy)
 }
 
-func sample(src *[pixels]byte, x, y int) byte {
+func warp(src *[pixels]rgb, mv [nBlock][2]int) [pixels]rgb {
+	var dst [pixels]rgb
+	for p := range dst {
+		dst[p] = predAt(src, mv, p)
+	}
+	return dst
+}
+
+func sample(src *[pixels]rgb, x, y int) rgb {
 	if uint(x) >= width || uint(y) >= height {
-		return 0
+		return rgb{}
 	}
 	return src[y*width+x]
 }
 
-func searchMV(prev, cur *[pixels]byte) [nBlock][2]int {
+// luma is the integer Rec.601 value the motion search matches on.
+func luma(p rgb) int {
+	return (19595*int(p[0]) + 38470*int(p[1]) + 7471*int(p[2]) + 32768) >> 16
+}
+
+func searchMV(prev, cur *[pixels]rgb) [nBlock][2]int {
 	var out [nBlock][2]int
 	b := 0
 	for by := 0; by < height; by += block {
@@ -527,13 +538,13 @@ func searchMV(prev, cur *[pixels]byte) [nBlock][2]int {
 	return out
 }
 
-func blockMiss(prev, cur *[pixels]byte, bx, by, dx, dy int) int {
+func blockMiss(prev, cur *[pixels]rgb, bx, by, dx, dy int) int {
 	mis := 0
 	for y := by; y < by+block; y++ {
 		for x := bx; x < bx+block; x++ {
 			p := sample(prev, x-dx, y-dy)
 			c := cur[y*width+x]
-			if (p > 1) != (c > 1) {
+			if (luma(p) > 1) != (luma(c) > 1) {
 				mis++
 			}
 		}
@@ -619,19 +630,12 @@ func (r *reader) motion() (int, error) {
 	return v, nil
 }
 
-func (r *reader) level(pred byte) (int, error) {
-	if pred > 1 {
-		return 0, ErrFormat
-	}
-	d, err := r.rice(kNew)
+func (r *reader) signed(k int) (int, error) {
+	n, err := r.rice(k)
 	if err != nil {
 		return 0, err
 	}
-	v := d + 2
-	if v > 255 {
-		return 0, ErrFormat
-	}
-	return v, nil
+	return unzig(n), nil
 }
 
 func writeGaps(w *bits, pos []int, k int) {
@@ -663,8 +667,8 @@ func readGaps(r *reader, count, k, limit int) ([]int, error) {
 	return pos, nil
 }
 
-func parse(src []byte) ([frames][pixels]byte, error) {
-	var pix [frames][pixels]byte
+func parse(src []byte) ([frames][pixels]rgb, error) {
+	var pix [frames][pixels]rgb
 	if len(src) == 0 || src[len(src)-1] != '\n' {
 		return pix, ErrFormat
 	}
@@ -674,15 +678,17 @@ func parse(src []byte) ([frames][pixels]byte, error) {
 	}
 	for f, line := range lines[1:] {
 		fields := bytes.Split(line, []byte(","))
-		if len(fields) != 1+pixels || string(fields[0]) != timeOf(f) {
+		if len(fields) != 1+pixels*channels || string(fields[0]) != timeOf(f) {
 			return pix, ErrFormat
 		}
-		for p, field := range fields[1:] {
-			v, err := parseLevel(field)
-			if err != nil {
-				return pix, err
+		for p := range pixels {
+			for c := range channels {
+				v, err := parseLevel(fields[1+p*channels+c])
+				if err != nil {
+					return pix, err
+				}
+				pix[f][p][c] = byte(v)
 			}
-			pix[f][p] = byte(v)
 		}
 	}
 	return pix, nil
@@ -705,15 +711,17 @@ func parseLevel(field []byte) (int, error) {
 	return v, nil
 }
 
-func format(pix [frames][pixels]byte) []byte {
+func format(pix [frames][pixels]rgb) []byte {
 	var b bytes.Buffer
 	b.WriteString(head)
 	b.WriteByte('\n')
 	for f := range frames {
 		b.WriteString(timeOf(f))
 		for p := range pixels {
-			b.WriteByte(',')
-			b.WriteString(strconv.Itoa(int(pix[f][p])))
+			for c := range channels {
+				b.WriteByte(',')
+				b.WriteString(strconv.Itoa(int(pix[f][p][c])))
+			}
 		}
 		b.WriteByte('\n')
 	}
