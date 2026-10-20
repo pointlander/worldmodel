@@ -32,7 +32,95 @@ func TestRoundTrip(t *testing.T) {
 	if len(compressed) != CompressedSize {
 		t.Fatalf("compressed %d bytes, want %d", len(compressed), CompressedSize)
 	}
+	if compressed[0] != 0 || compressed[1] != 32 || compressed[2] != 0 || compressed[3] != 32 {
+		t.Fatalf("geometry prefix %x", compressed[:4])
+	}
 	t.Logf("cell.csv: %d -> %d bytes", len(original), len(compressed))
+}
+
+func TestGeom(t *testing.T) {
+	check := func(w, h, block, mv, gx, gy, stride, bits, cellMin, scale int) {
+		t.Helper()
+		g, err := geom(w, h)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if g.block != block || g.mvRange != mv || g.gridX != gx || g.gridY != gy ||
+			g.stride != stride || g.countBits != bits || g.cellMin != cellMin ||
+			g.nBlock != gx*gy || displayScale(g) != scale {
+			t.Fatalf("%dx%d geo %+v scale %d", w, h, g, displayScale(g))
+		}
+	}
+	check(32, 32, 8, 2, 4, 4, 1, 16, 8, 8)
+	check(64, 64, 16, 4, 4, 4, 1, 32, 32, 4)
+	check(16, 16, 4, 1, 4, 4, 1, 16, 8, 16)
+	check(762, 590, 128, 8, 6, 5, 16, 32, 3512, 1)
+	if _, err := geom(0, 32); err != ErrFormat {
+		t.Fatalf("zero width: %v", err)
+	}
+	if _, err := geom(20000, 20000); err != ErrFormat {
+		t.Fatalf("huge frame: %v", err)
+	}
+}
+
+func TestOtherSizes(t *testing.T) {
+	for _, wh := range [][2]int{{16, 16}, {40, 30}, {45, 45}, {64, 64}, {260, 256}} {
+		w, h := wh[0], wh[1]
+		raw := syntheticClip(w, h)
+		blob, err := Compress(raw)
+		if err != nil {
+			t.Fatalf("%dx%d compress: %v", w, h, err)
+		}
+		if len(blob) < 4 || int(blob[0])<<8|int(blob[1]) != w || int(blob[2])<<8|int(blob[3]) != h {
+			t.Fatalf("%dx%d prefix %x", w, h, blob[:min(4, len(blob))])
+		}
+		got, err := Decompress(blob)
+		if err != nil {
+			t.Fatalf("%dx%d decompress: %v", w, h, err)
+		}
+		if !bytes.Equal(got, raw) {
+			t.Fatalf("%dx%d round trip mismatch", w, h)
+		}
+		g, pix, err := parse(got)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if g.w != w || g.h != h || len(pix) != frames || len(pix[0]) != w*h {
+			t.Fatalf("%dx%d parsed as %dx%d", w, h, g.w, g.h)
+		}
+	}
+}
+
+func syntheticClip(w, h int) []byte {
+	g, err := geom(w, h)
+	if err != nil {
+		panic(err)
+	}
+	pix := make([][]rgb, frames)
+	for f := range pix {
+		row := make([]rgb, g.pixels)
+		for i := range row {
+			row[i] = bg
+		}
+		cx := g.block + (f % (g.w / 2))
+		cy := g.block/2 + (f % (g.h / 2))
+		stamp(g, row, cx, cy, rgb{220, 30, byte(20 + f%50)})
+		stamp(g, row, g.w-1, g.h-1, rgb{byte(f + 1), 80, 40})
+		pix[f] = row
+	}
+	return format(g, pix)
+}
+
+func stamp(g geo, row []rgb, cx, cy int, col rgb) {
+	for dy := -1; dy <= 1; dy++ {
+		for dx := -1; dx <= 1; dx++ {
+			x, y := cx+dx, cy+dy
+			if uint(x) >= uint(g.w) || uint(y) >= uint(g.h) {
+				continue
+			}
+			row[y*g.w+x] = col
+		}
+	}
 }
 
 func TestTriangleRestores(t *testing.T) {
@@ -76,15 +164,19 @@ func TestTriangleRestores(t *testing.T) {
 }
 
 func TestFieldTranslates(t *testing.T) {
-	m := feaMesh{nodes: []feaNode{
+	g, err := geom(32, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := feaMesh{g: g, nodes: []feaNode{
 		{X: 1, Y: 1, x: 1, y: 1},
 		{X: 2, Y: 1, x: 2, y: 1},
 		{X: 1, Y: 2, x: 1, y: 2},
 	}}
 	m.addTri(0, 1, 2)
-	var mv [nBlock][2]int
-	mv[blockAt(1, 1)] = [2]int{1, 0}
-	m.advanceDriven(1, &mv)
+	mv := make([][2]int, g.nBlock)
+	mv[m.blockAt(1, 1)] = [2]int{1, 0}
+	m.advanceDriven(1, mv)
 	for i := range m.nodes {
 		got := m.nodes[i].x - m.nodes[i].X
 		if got < 0.7 || got > 0.85 {
@@ -114,16 +206,16 @@ func TestPredict(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if future != again {
+	if !sameFrames(future, again) {
 		t.Fatal("forecast changed between draws")
 	}
-	pix, err := parse(original)
+	g, pix, err := parse(original)
 	if err != nil {
 		t.Fatal(err)
 	}
 	moved := false
 	for f := range future {
-		if future[f] != pix[frames-1] {
+		if !samePic(future[f], pix[frames-1]) {
 			moved = true
 			break
 		}
@@ -146,21 +238,19 @@ func TestPredict(t *testing.T) {
 		t.Fatalf("cells faded: %d bright pixels, source had %d", bright, srcBright)
 	}
 	kept := 0
-	for _, c := range components(&future[half-1]) {
-		if len(c.pix) >= cellMin {
+	for _, c := range components(g, future[half-1]) {
+		if len(c.pix) >= g.cellMin {
 			kept++
 		}
 	}
 	if kept < 3 {
 		t.Fatalf("cells lost: %d remain", kept)
 	}
-	clip := make([][pixels]rgb, 0, frames+half)
-	for f := range pix {
-		clip = append(clip, pix[f])
-	}
-	clip = append(clip, future[:]...)
+	clip := make([][]rgb, 0, frames+half)
+	clip = append(clip, pix...)
+	clip = append(clip, future...)
 	path := filepath.Join(t.TempDir(), "future.gif")
-	if err := writeGIF(path, clip); err != nil {
+	if err := writeGIF(path, g, clip); err != nil {
 		t.Fatal(err)
 	}
 	f, err := os.Open(path)
@@ -168,33 +258,103 @@ func TestPredict(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer f.Close()
-	g, err := gif.DecodeAll(f)
+	decoded, err := gif.DecodeAll(f)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(g.Image) != frames+half || len(g.Delay) != frames+half {
-		t.Fatalf("gif frames %d delays %d", len(g.Image), len(g.Delay))
+	if len(decoded.Image) != frames+half || len(decoded.Delay) != frames+half {
+		t.Fatalf("gif frames %d delays %d", len(decoded.Image), len(decoded.Delay))
 	}
-	if g.Image[0].Bounds().Dx() != width*gifScale || g.Image[0].Bounds().Dy() != height*gifScale {
-		t.Fatalf("gif size %v", g.Image[0].Bounds())
+	scale := displayScale(g)
+	if decoded.Image[0].Bounds().Dx() != g.w*scale || decoded.Image[0].Bounds().Dy() != g.h*scale {
+		t.Fatalf("gif size %v", decoded.Image[0].Bounds())
 	}
 	check := func(frame, x, y int, want rgb) {
 		t.Helper()
-		if got := gifRGB(g.Image[frame], x*gifScale, y*gifScale); got != want {
+		if got := gifRGB(decoded.Image[frame], x*scale, y*scale); got != want {
 			t.Fatalf("frame %d pixel %d,%d = %v, want %v", frame, x, y, got, want)
 		}
-		if got := gifRGB(g.Image[frame], x*gifScale+gifScale-1, y*gifScale+gifScale-1); got != want {
+		if got := gifRGB(decoded.Image[frame], x*scale+scale-1, y*scale+scale-1); got != want {
 			t.Fatalf("frame %d pixel %d,%d scale edge = %v, want %v", frame, x, y, got, want)
 		}
 	}
 	check(0, 0, 0, pix[0][0])
-	check(frames-1, 4, 4, pix[frames-1][4*width+4])
-	check(frames, 4, 4, future[0][4*width+4])
-	for _, d := range g.Delay {
+	check(frames-1, 4, 4, pix[frames-1][4*g.w+4])
+	check(frames, 4, 4, future[0][4*g.w+4])
+	for _, d := range decoded.Delay {
 		if d != gifDelay {
 			t.Fatalf("delay %d", d)
 		}
 	}
+}
+
+func TestPalette(t *testing.T) {
+	g, err := geom(32, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exact := make([]rgb, g.pixels)
+	for i := range exact {
+		exact[i] = bg
+	}
+	exact[g.w+1] = rgb{9, 8, 7}
+	busy := make([]rgb, g.pixels)
+	for y := 0; y < g.h; y++ {
+		for x := 0; x < g.w; x++ {
+			busy[y*g.w+x] = rgb{byte(x), byte(y), byte(x*3 + y*5)}
+		}
+	}
+	if !tooManyColors(busy) {
+		t.Fatal("expected more than 256 colors")
+	}
+	path := filepath.Join(t.TempDir(), "pal.gif")
+	if err := writeGIF(path, g, [][]rgb{exact, busy}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	decoded, err := gif.DecodeAll(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scale := displayScale(g)
+	if gifRGB(decoded.Image[0], scale, scale) != (rgb{9, 8, 7}) {
+		t.Fatalf("exact color %v", gifRGB(decoded.Image[0], scale, scale))
+	}
+	// (1,1) is rgb{1,1,8}. 3-3-2 sends it to black, and the palette stays legal.
+	if gifRGB(decoded.Image[1], scale, scale) != (rgb{}) {
+		t.Fatalf("quantized color %v", gifRGB(decoded.Image[1], scale, scale))
+	}
+	if len(decoded.Image[1].Palette) > 256 {
+		t.Fatalf("palette %d", len(decoded.Image[1].Palette))
+	}
+}
+
+func sameFrames(a, b [][]rgb) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !samePic(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func samePic(a, b []rgb) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func gifRGB(img image.Image, x, y int) rgb {
@@ -224,6 +384,11 @@ func TestRejects(t *testing.T) {
 	flipped[len(flipped)-1] ^= 1
 	if _, err := Decompress(flipped); err != ErrFormat {
 		t.Fatalf("padding: %v", err)
+	}
+	zeroW := append([]byte{}, compressed...)
+	zeroW[0], zeroW[1] = 0, 0
+	if _, err := Decompress(zeroW); err != ErrFormat {
+		t.Fatalf("zero width: %v", err)
 	}
 	if _, err := Compress(original[:len(original)-1]); err != ErrFormat {
 		t.Fatalf("truncated file: %v", err)

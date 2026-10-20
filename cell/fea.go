@@ -38,24 +38,25 @@ type feaElem struct {
 }
 
 type feaMesh struct {
+	g     geo
 	nodes []feaNode
 	elems []feaElem
 }
 
-func meshOf(frame *[pixels]rgb, b *body) feaMesh {
-	m := feaMesh{nodes: make([]feaNode, len(b.pix))}
+func meshOf(g geo, frame []rgb, b *body) feaMesh {
+	m := feaMesh{g: g, nodes: make([]feaNode, len(b.pix))}
 	idx := make(map[int]int, len(b.pix))
 	for i, p := range b.pix {
-		x, y := float64(p%width), float64(p/width)
+		x, y := float64(p%g.w), float64(p/g.w)
 		m.nodes[i] = feaNode{x: x, y: y, X: x, Y: y, col: frame[p]}
 		idx[p] = i
 	}
 	for _, p := range b.pix {
-		x, y := p%width, p/width
-		if x+1 >= width || y+1 >= height {
+		x, y := p%g.w, p/g.w
+		if x+1 >= g.w || y+1 >= g.h {
 			continue
 		}
-		p10, p01, p11 := p+1, p+width, p+width+1
+		p10, p01, p11 := p+1, p+g.w, p+g.w+1
 		i00, ok00 := idx[p]
 		i10, ok10 := idx[p10]
 		i01, ok01 := idx[p01]
@@ -157,7 +158,7 @@ func (m *feaMesh) advance(time float64) {
 
 // advanceDriven integrates the mesh for time frames. When mv is set, drag
 // pulls each node toward the motion vector of the block under that node.
-func (m *feaMesh) advanceDriven(time float64, mv *[nBlock][2]int) {
+func (m *feaMesh) advanceDriven(time float64, mv [][2]int) {
 	steps := int(time/feaDt + 0.5)
 	for range steps {
 		fx, fy := m.forces()
@@ -166,7 +167,7 @@ func (m *feaMesh) advanceDriven(time float64, mv *[nBlock][2]int) {
 			ax := -fx[i] / n.m
 			ay := -fy[i] / n.m
 			if mv != nil {
-				b := blockAt(n.x, n.y)
+				b := m.blockAt(n.x, n.y)
 				ax += feaDrag * (float64(mv[b][0]) - n.vx)
 				ay += feaDrag * (float64(mv[b][1]) - n.vy)
 			}
@@ -178,7 +179,7 @@ func (m *feaMesh) advanceDriven(time float64, mv *[nBlock][2]int) {
 	}
 }
 
-func blockAt(x, y float64) int {
+func (m *feaMesh) blockAt(x, y float64) int {
 	ix := int(x)
 	iy := int(y)
 	if ix < 0 {
@@ -187,38 +188,38 @@ func blockAt(x, y float64) int {
 	if iy < 0 {
 		iy = 0
 	}
-	if ix >= width {
-		ix = width - 1
+	if ix >= m.g.w {
+		ix = m.g.w - 1
 	}
-	if iy >= height {
-		iy = height - 1
+	if iy >= m.g.h {
+		iy = m.g.h - 1
 	}
-	return (iy/block)*grid + ix/block
+	return (iy/m.g.block)*m.g.gridX + ix/m.g.block
 }
 
-func raster(meshes []feaMesh) [pixels]rgb {
-	var frame [pixels]rgb
+func raster(g geo, meshes []feaMesh) []rgb {
+	frame := make([]rgb, g.pixels)
 	for i := range frame {
 		frame[i] = bg
 	}
 	for mi := range meshes {
 		m := &meshes[mi]
-		for _, e := range m.elems {
-			paintTri(&frame, m, &e)
+		for ei := range m.elems {
+			paintTri(g, frame, m, &m.elems[ei])
 		}
 		for i := range m.nodes {
 			n := &m.nodes[i]
 			ix, iy := iround(n.x), iround(n.y)
-			if uint(ix) >= width || uint(iy) >= height {
+			if uint(ix) >= uint(g.w) || uint(iy) >= uint(g.h) {
 				continue
 			}
-			frame[iy*width+ix] = n.col
+			frame[iy*g.w+ix] = n.col
 		}
 	}
 	return frame
 }
 
-func paintTri(frame *[pixels]rgb, m *feaMesh, e *feaElem) {
+func paintTri(g geo, frame []rgb, m *feaMesh, e *feaElem) {
 	n0 := &m.nodes[e.n[0]]
 	n1 := &m.nodes[e.n[1]]
 	n2 := &m.nodes[e.n[2]]
@@ -232,11 +233,11 @@ func paintTri(frame *[pixels]rgb, m *feaMesh, e *feaElem) {
 	if miny < 0 {
 		miny = 0
 	}
-	if maxx >= width {
-		maxx = width - 1
+	if maxx >= g.w {
+		maxx = g.w - 1
 	}
-	if maxy >= height {
-		maxy = height - 1
+	if maxy >= g.h {
+		maxy = g.h - 1
 	}
 	den := (n1.y-n2.y)*(n0.x-n2.x) + (n2.x-n1.x)*(n0.y-n2.y)
 	if den > -1e-8 && den < 1e-8 {
@@ -253,11 +254,11 @@ func paintTri(frame *[pixels]rgb, m *feaMesh, e *feaElem) {
 			}
 			switch {
 			case a >= b && a >= c:
-				frame[y*width+x] = n0.col
+				frame[y*g.w+x] = n0.col
 			case b >= c:
-				frame[y*width+x] = n1.col
+				frame[y*g.w+x] = n1.col
 			default:
-				frame[y*width+x] = n2.col
+				frame[y*g.w+x] = n2.col
 			}
 		}
 	}
