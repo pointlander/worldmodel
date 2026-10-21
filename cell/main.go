@@ -8,7 +8,8 @@
 // 64, full, or WxH. full keeps the video's own frame size and does not scale.
 // -video selects the file and defaults to DNA cell death and division-L.mp4.
 // Each row is the frame time in seconds followed by the red, green, and blue
-// sample of every pixel in row-major order.
+// sample of every pixel in row-major order. The time is the frame index
+// divided by the frame rate reported by the video.
 //
 // cell predict writes the original frames, then 33 future frames, as a GIF.
 // A Markov chain draws the next motion field, and each cell's elastic mesh
@@ -24,7 +25,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 )
@@ -33,8 +33,6 @@ const (
 	usageText    = "usage: cell [-size 32|64|full|WxH] [-video FILE] [csv]\n       cell predict [csv] [gif]"
 	defaultVideo = "DNA cell death and division-L.mp4"
 )
-
-var ptsTime = regexp.MustCompile(`n:\s*\d+\s+pts:\s*\S+\s+pts_time:([0-9.]+)`)
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -66,14 +64,22 @@ func run(args []string) error {
 	if csvArg != "" {
 		csvPath = csvArg
 	}
-	times, frames, err := framesOf(video, w, h, native)
+	fps, err := probeRate(video)
 	if err != nil {
 		return err
+	}
+	frames, err := framesOf(video, w, h, native)
+	if err != nil {
+		return err
+	}
+	times := make([]string, len(frames))
+	for i := range times {
+		times[i] = frameTime(i, fps)
 	}
 	if err := writeCSV(csvPath, w, h, times, frames); err != nil {
 		return err
 	}
-	fmt.Printf("wrote %d frames of %dx%d to %s\n", len(frames), w, h, csvPath)
+	fmt.Printf("wrote %d frames of %dx%d at %d/%d fps to %s\n", len(frames), w, h, fps.num, fps.den, csvPath)
 	return nil
 }
 
@@ -193,12 +199,51 @@ func csvName(w, h int) string {
 	return fmt.Sprintf("cell%dx%d.csv", w, h)
 }
 
+func probeRate(video string) (rate, error) {
+	for _, key := range []string{"avg_frame_rate", "r_frame_rate"} {
+		out, err := exec.Command("ffprobe",
+			"-v", "error",
+			"-select_streams", "v:0",
+			"-show_entries", "stream="+key,
+			"-of", "csv=p=0",
+			video,
+		).Output()
+		if err != nil {
+			return rate{}, fmt.Errorf("ffprobe: %w", err)
+		}
+		s := strings.TrimSpace(string(out))
+		if i := strings.IndexByte(s, '\n'); i >= 0 {
+			s = strings.TrimSpace(s[:i])
+		}
+		fps, err := parseRate(s)
+		if err != nil || fps.num == 0 {
+			continue
+		}
+		return fps, nil
+	}
+	return rate{}, fmt.Errorf("ffprobe: no frame rate for %s", video)
+}
+
+func parseRate(s string) (rate, error) {
+	numText, denText, ok := strings.Cut(s, "/")
+	if !ok {
+		return rate{}, fmt.Errorf("ffprobe: unexpected frame rate %q", s)
+	}
+	num, err1 := strconv.Atoi(numText)
+	den, err2 := strconv.Atoi(denText)
+	if err1 != nil || err2 != nil || num <= 0 || den <= 0 || num > 0xffffffff || den > 0xffffffff {
+		return rate{}, fmt.Errorf("ffprobe: unexpected frame rate %q", s)
+	}
+	g := gcd64(int64(num), int64(den))
+	return rate{num: int(int64(num) / g), den: int(int64(den) / g)}, nil
+}
+
 // framesOf asks ffmpeg for raw rgb24 frames. native leaves the picture at
 // the video's own size. Otherwise the scale filter runs before format=rgb24.
-func framesOf(video string, w, h int, native bool) (times []string, frames [][]byte, err error) {
-	vf := fmt.Sprintf("scale=%d:%d:flags=lanczos,format=rgb24,showinfo", w, h)
+func framesOf(video string, w, h int, native bool) (frames [][]byte, err error) {
+	vf := fmt.Sprintf("scale=%d:%d:flags=lanczos,format=rgb24", w, h)
 	if native {
-		vf = "format=rgb24,showinfo"
+		vf = "format=rgb24"
 	}
 	cmd := exec.Command("ffmpeg",
 		"-hide_banner",
@@ -212,14 +257,14 @@ func framesOf(video string, w, h int, native bool) (times []string, frames [][]b
 	)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if err := cmd.Start(); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	var log bytes.Buffer
 	logErr := make(chan error, 1)
@@ -233,31 +278,25 @@ func framesOf(video string, w, h int, native bool) (times []string, frames [][]b
 	}
 	waitErr := cmd.Wait()
 	if readErr != nil {
-		return nil, nil, readErr
+		return nil, readErr
 	}
 	if waitErr != nil {
 		msg := log.String()
 		if len(msg) > 2000 {
 			msg = msg[len(msg)-2000:]
 		}
-		return nil, nil, fmt.Errorf("ffmpeg: %w\n%s", waitErr, msg)
+		return nil, fmt.Errorf("ffmpeg: %w\n%s", waitErr, msg)
 	}
 	rawFrame := w * h * channels
-	if len(raw)%rawFrame != 0 {
-		return nil, nil, fmt.Errorf("ffmpeg wrote %d bytes, not a whole number of %d-byte frames", len(raw), rawFrame)
-	}
-	for _, m := range ptsTime.FindAllStringSubmatch(log.String(), -1) {
-		times = append(times, m[1])
+	if rawFrame == 0 || len(raw)%rawFrame != 0 {
+		return nil, fmt.Errorf("ffmpeg wrote %d bytes, not a whole number of %d-byte frames", len(raw), rawFrame)
 	}
 	n := len(raw) / rawFrame
-	if len(times) != n {
-		return nil, nil, fmt.Errorf("ffmpeg reported %d timestamps for %d frames", len(times), n)
-	}
 	frames = make([][]byte, n)
 	for i := range frames {
 		frames[i] = raw[i*rawFrame : (i+1)*rawFrame]
 	}
-	return times, frames, nil
+	return frames, nil
 }
 
 func writeCSV(path string, w, h int, times []string, frames [][]byte) error {

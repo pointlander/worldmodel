@@ -13,8 +13,6 @@ import (
 	"path/filepath"
 )
 
-const gifDelay = 25 // centiseconds; the clip is four frames per second
-
 func forecast(args []string) error {
 	if len(args) > 2 {
 		return fmt.Errorf("usage: cell predict [csv] [gif]")
@@ -34,7 +32,7 @@ func forecast(args []string) error {
 	if err != nil {
 		return err
 	}
-	g, pix, err := parse(src)
+	g, fps, pix, err := parse(src)
 	if err != nil {
 		return err
 	}
@@ -49,7 +47,7 @@ func forecast(args []string) error {
 	clip := make([][]rgb, 0, frames+half)
 	clip = append(clip, pix...)
 	clip = append(clip, future...)
-	if err := writeGIF(gifPath, g, clip); err != nil {
+	if err := writeGIF(gifPath, g, clip, centiseconds(fps)); err != nil {
 		return err
 	}
 	fmt.Printf("wrote %d source frames and %d predicted frames to %s\n", frames, half, gifPath)
@@ -77,7 +75,7 @@ func displayScale(g geo) int {
 	return s
 }
 
-func writeGIF(path string, g geo, clip [][]rgb) error {
+func writeGIF(path string, g geo, clip [][]rgb, delay int) error {
 	scale := displayScale(g)
 	img := &gif.GIF{LoopCount: 0}
 	for f := range clip {
@@ -93,7 +91,7 @@ func writeGIF(path string, g geo, clip [][]rgb) error {
 			}
 		}
 		img.Image = append(img.Image, frame)
-		img.Delay = append(img.Delay, gifDelay)
+		img.Delay = append(img.Delay, delay)
 	}
 	out, err := os.Create(path)
 	if err != nil {

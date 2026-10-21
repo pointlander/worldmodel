@@ -32,8 +32,8 @@ var (
 )
 
 // CompressedSize is the length of the blob for the canonical 32x32 cell.csv.
-// 204701 bits is the shared-luma motion coding plus the 16-bit width and height.
-const CompressedSize = 25588
+// 204765 bits is the shared-luma motion coding, the picture size, and the 4/1 frame rate.
+const CompressedSize = 25596
 
 // ErrFormat reports an input that is not a canonical cell clip or a blob
 // this model can decode.
@@ -43,10 +43,11 @@ var ErrFormat = errors.New("cell: invalid data")
 // canonical clip is 1.
 var bg = rgb{0, 0, 1}
 
-// The clip is 66 color frames at four per second, so the time column is a
-// function of the frame index. The blob starts with the width and the height.
+// The clip is 66 color frames. The time column is the frame index divided
+// by the frame rate, and that rate is stored after the width and the height.
+// On the canonical clip the rate is 4/1, so the times are 0, 0.25, 0.5, 0.75.
 // Block size, search radius, and the width of the counts are functions of
-// that size; see geom. Motion is one field for every channel. A zero vector
+// the picture size; see geom. Motion is one field for every channel. A zero vector
 // is one bit; any other vector is a zigzag Rice pair. The sample under (x, y)
 // is the previous pixel at (x-dx, y-dy). Off-frame samples are black, which
 // is not the background.
@@ -157,7 +158,7 @@ func headerOf(g geo) string {
 
 // Compress packs a canonical cell CSV into its fixed-parameter motion coding.
 func Compress(src []byte) ([]byte, error) {
-	g, pix, err := parse(src)
+	g, fps, pix, err := parse(src)
 	if err != nil {
 		return nil, err
 	}
@@ -199,6 +200,8 @@ func Compress(src []byte) ([]byte, error) {
 	var w bits
 	w.bits(g.w, 16)
 	w.bits(g.h, 16)
+	w.bits(fps.num, 32)
+	w.bits(fps.den, 32)
 	for c := range channels {
 		w.bits(len(f0[c].pos), g.countBits)
 	}
@@ -252,7 +255,7 @@ func Predict(blob []byte) ([][]rgb, error) {
 	if err != nil {
 		return nil, err
 	}
-	g, pix, err := parse(raw)
+	g, _, pix, err := parse(raw)
 	if err != nil {
 		return nil, err
 	}
@@ -430,6 +433,18 @@ func Decompress(src []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	num, err := r.bits(32)
+	if err != nil {
+		return nil, err
+	}
+	den, err := r.bits(32)
+	if err != nil {
+		return nil, err
+	}
+	fps := rate{num: num, den: den}
+	if fps.num <= 0 || fps.den <= 0 {
+		return nil, ErrFormat
+	}
 	g, err := geom(w, h)
 	if err != nil {
 		return nil, err
@@ -521,7 +536,7 @@ func Decompress(src []byte) ([]byte, error) {
 	if err := r.done(); err != nil {
 		return nil, err
 	}
-	return format(g, pix), nil
+	return format(g, fps, pix), nil
 }
 
 func readAbs(r *reader, frame []rgb, c, count, kPos, kVal, limit int) error {
@@ -794,36 +809,46 @@ func readGaps(r *reader, count, k, limit int) ([]int, error) {
 	return pos, nil
 }
 
-func parse(src []byte) (geo, [][]rgb, error) {
+func parse(src []byte) (geo, rate, [][]rgb, error) {
 	if len(src) == 0 || src[len(src)-1] != '\n' {
-		return geo{}, nil, ErrFormat
+		return geo{}, rate{}, nil, ErrFormat
 	}
 	lines := bytes.Split(src[:len(src)-1], []byte("\n"))
 	if len(lines) != 1+frames {
-		return geo{}, nil, ErrFormat
+		return geo{}, rate{}, nil, ErrFormat
 	}
 	g, err := headerGeo(lines[0])
 	if err != nil {
-		return geo{}, nil, err
+		return geo{}, rate{}, nil, err
 	}
-	pix := make([][]rgb, frames)
+	times := make([]string, frames)
+	rows := make([][][]byte, frames)
 	for f, line := range lines[1:] {
 		fields := bytes.Split(line, []byte(","))
-		if len(fields) != 1+g.pixels*channels || string(fields[0]) != timeOf(f) {
-			return geo{}, nil, ErrFormat
+		if len(fields) != 1+g.pixels*channels {
+			return geo{}, rate{}, nil, ErrFormat
 		}
+		times[f] = string(fields[0])
+		rows[f] = fields
+	}
+	fps, err := rateFromTimes(times)
+	if err != nil {
+		return geo{}, rate{}, nil, err
+	}
+	pix := make([][]rgb, frames)
+	for f, fields := range rows {
 		pix[f] = make([]rgb, g.pixels)
 		for p := range g.pixels {
 			for c := range channels {
 				v, err := parseLevel(fields[1+p*channels+c])
 				if err != nil {
-					return geo{}, nil, err
+					return geo{}, rate{}, nil, err
 				}
 				pix[f][p][c] = byte(v)
 			}
 		}
 	}
-	return g, pix, nil
+	return g, fps, pix, nil
 }
 
 func headerGeo(line []byte) (geo, error) {
@@ -880,12 +905,12 @@ func parseLevel(field []byte) (int, error) {
 	return v, nil
 }
 
-func format(g geo, pix [][]rgb) []byte {
+func format(g geo, fps rate, pix [][]rgb) []byte {
 	var b bytes.Buffer
 	b.WriteString(headerOf(g))
 	b.WriteByte('\n')
 	for f := range frames {
-		b.WriteString(timeOf(f))
+		b.WriteString(frameTime(f, fps))
 		for p := range g.pixels {
 			for c := range channels {
 				b.WriteByte(',')
@@ -897,18 +922,176 @@ func format(g geo, pix [][]rgb) []byte {
 	return b.Bytes()
 }
 
-func timeOf(i int) string {
-	sec, frac := i/4, i%4
-	switch frac {
-	case 0:
-		return strconv.Itoa(sec)
-	case 1:
-		return strconv.Itoa(sec) + ".25"
-	case 2:
-		return strconv.Itoa(sec) + ".5"
-	default:
-		return strconv.Itoa(sec) + ".75"
+// rate is frames per second as the reduced fraction num/den.
+type rate struct {
+	num, den int
+}
+
+// frameTime is the canonical text of frame i. A terminating decimal is
+// written the short way, so 4/1 yields 0, 0.25, 0.5, 0.75. Any other
+// exact value is the reduced fraction.
+func frameTime(i int, fps rate) string {
+	if fps.num <= 0 || fps.den <= 0 {
+		return ""
 	}
+	num := int64(i) * int64(fps.den)
+	den := int64(fps.num)
+	g := gcd64(num, den)
+	num /= g
+	den /= g
+	if den == 1 {
+		return strconv.FormatInt(num, 10)
+	}
+	if text, ok := decimal(num, den); ok {
+		return text
+	}
+	return strconv.FormatInt(num, 10) + "/" + strconv.FormatInt(den, 10)
+}
+
+func decimal(num, den int64) (string, bool) {
+	d := den
+	for d%2 == 0 {
+		d /= 2
+	}
+	for d%5 == 0 {
+		d /= 5
+	}
+	if d != 1 {
+		return "", false
+	}
+	sec := num / den
+	rem := num % den
+	digits := make([]byte, 0, 8)
+	for rem != 0 {
+		rem *= 10
+		digits = append(digits, byte('0'+rem/den))
+		rem %= den
+		if len(digits) > 12 {
+			return "", false
+		}
+	}
+	return strconv.FormatInt(sec, 10) + "." + string(digits), true
+}
+
+func rateFromTimes(times []string) (rate, error) {
+	if len(times) < 2 || times[0] != "0" {
+		return rate{}, ErrFormat
+	}
+	n, d, err := parseSeconds(times[1])
+	if err != nil || n <= 0 || d <= 0 {
+		return rate{}, ErrFormat
+	}
+	g := gcd64(n, d)
+	n /= g
+	d /= g
+	if d > int64(^uint32(0)) || n > int64(^uint32(0)) {
+		return rate{}, ErrFormat
+	}
+	// Frame 1 is one frame period, so the rate is the reciprocal.
+	fps := rate{num: int(d), den: int(n)}
+	for i, s := range times {
+		if s != frameTime(i, fps) {
+			return rate{}, ErrFormat
+		}
+	}
+	return fps, nil
+}
+
+func parseSeconds(s string) (int64, int64, error) {
+	if slash := strings.IndexByte(s, '/'); slash >= 0 {
+		num, err := parseCanonInt(s[:slash])
+		if err != nil {
+			return 0, 0, err
+		}
+		den, err := parseCanonInt(s[slash+1:])
+		if err != nil || den <= 0 {
+			return 0, 0, err
+		}
+		return reduce(num, den)
+	}
+	dot := strings.IndexByte(s, '.')
+	if dot < 0 {
+		n, err := parseCanonInt(s)
+		if err != nil {
+			return 0, 0, err
+		}
+		return n, 1, nil
+	}
+	whole, frac := s[:dot], s[dot+1:]
+	if len(frac) == 0 || len(frac) > 12 || frac[len(frac)-1] == '0' {
+		return 0, 0, ErrFormat
+	}
+	n, err := parseCanonInt(whole)
+	if err != nil {
+		return 0, 0, err
+	}
+	var f int64
+	scale := int64(1)
+	for _, c := range frac {
+		if c < '0' || c > '9' {
+			return 0, 0, ErrFormat
+		}
+		f = f*10 + int64(c-'0')
+		scale *= 10
+	}
+	if n > (1<<62)/scale {
+		return 0, 0, ErrFormat
+	}
+	return reduce(n*scale+f, scale)
+}
+
+func parseCanonInt(s string) (int64, error) {
+	if s == "" || (len(s) > 1 && s[0] == '0') {
+		return 0, ErrFormat
+	}
+	n := int64(0)
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, ErrFormat
+		}
+		n = n*10 + int64(c-'0')
+		if n < 0 {
+			return 0, ErrFormat
+		}
+	}
+	return n, nil
+}
+
+func reduce(n, d int64) (int64, int64, error) {
+	if d <= 0 || n < 0 {
+		return 0, 0, ErrFormat
+	}
+	g := gcd64(n, d)
+	return n / g, d / g, nil
+}
+
+func gcd64(a, b int64) int64 {
+	if a < 0 {
+		a = -a
+	}
+	if b < 0 {
+		b = -b
+	}
+	for b != 0 {
+		a, b = b, a%b
+	}
+	if a == 0 {
+		return 1
+	}
+	return a
+}
+
+// centiseconds is the GIF delay for one frame at this rate, rounded to
+// the nearest centisecond and at least 1. 4/1 is 25.
+func centiseconds(fps rate) int {
+	if fps.num <= 0 || fps.den <= 0 {
+		return 1
+	}
+	cs := (200*int64(fps.den) + int64(fps.num)) / (2 * int64(fps.num))
+	if cs < 1 {
+		return 1
+	}
+	return int(cs)
 }
 
 // bits is a most-significant-bit-first stream. Rice codes write a unary

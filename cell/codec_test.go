@@ -49,6 +49,56 @@ func TestVideoFlag(t *testing.T) {
 	}
 }
 
+func TestFrameRate(t *testing.T) {
+	fps4 := rate{4, 1}
+	if frameTime(0, fps4) != "0" || frameTime(1, fps4) != "0.25" || frameTime(2, fps4) != "0.5" ||
+		frameTime(3, fps4) != "0.75" || frameTime(5, fps4) != "1.25" || frameTime(65, fps4) != "16.25" {
+		t.Fatalf("4/1 times %q %q %q", frameTime(1, fps4), frameTime(2, fps4), frameTime(65, fps4))
+	}
+	if centiseconds(fps4) != 25 {
+		t.Fatalf("delay %d", centiseconds(fps4))
+	}
+	video, err := defaultVideoPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	probed, err := probeRate(video)
+	if err != nil || probed != fps4 {
+		t.Fatalf("probed %d/%d %v", probed.num, probed.den, err)
+	}
+	for _, fps := range []rate{{10, 1}, {24, 1}, {30000, 1001}} {
+		g, err := geom(16, 16)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pix := make([][]rgb, frames)
+		for f := range pix {
+			pix[f] = make([]rgb, g.pixels)
+			for i := range pix[f] {
+				pix[f][i] = bg
+			}
+			pix[f][0] = rgb{byte(f + 1), 3, 4}
+		}
+		raw := format(g, fps, pix)
+		blob, err := Compress(raw)
+		if err != nil {
+			t.Fatalf("%d/%d compress: %v", fps.num, fps.den, err)
+		}
+		back, err := Decompress(blob)
+		if err != nil || !bytes.Equal(back, raw) {
+			t.Fatalf("%d/%d round trip %v", fps.num, fps.den, err)
+		}
+		num := int(blob[4])<<24 | int(blob[5])<<16 | int(blob[6])<<8 | int(blob[7])
+		den := int(blob[8])<<24 | int(blob[9])<<16 | int(blob[10])<<8 | int(blob[11])
+		if num != fps.num || den != fps.den {
+			t.Fatalf("stored %d/%d, want %d/%d", num, den, fps.num, fps.den)
+		}
+	}
+	if frameTime(1, rate{24, 1}) != "1/24" || frameTime(1, rate{10, 1}) != "0.1" {
+		t.Fatalf("times %s %s", frameTime(1, rate{24, 1}), frameTime(1, rate{10, 1}))
+	}
+}
+
 func TestRoundTrip(t *testing.T) {
 	original, err := os.ReadFile("cell.csv")
 	if err != nil {
@@ -70,6 +120,9 @@ func TestRoundTrip(t *testing.T) {
 	}
 	if compressed[0] != 0 || compressed[1] != 32 || compressed[2] != 0 || compressed[3] != 32 {
 		t.Fatalf("geometry prefix %x", compressed[:4])
+	}
+	if !bytes.Equal(compressed[4:12], []byte{0, 0, 0, 4, 0, 0, 0, 1}) {
+		t.Fatalf("frame rate %x", compressed[4:12])
 	}
 	t.Logf("cell.csv: %d -> %d bytes", len(original), len(compressed))
 }
@@ -117,12 +170,12 @@ func TestOtherSizes(t *testing.T) {
 		if !bytes.Equal(got, raw) {
 			t.Fatalf("%dx%d round trip mismatch", w, h)
 		}
-		g, pix, err := parse(got)
+		g, fps, pix, err := parse(got)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if g.w != w || g.h != h || len(pix) != frames || len(pix[0]) != w*h {
-			t.Fatalf("%dx%d parsed as %dx%d", w, h, g.w, g.h)
+		if g.w != w || g.h != h || fps != (rate{4, 1}) || len(pix) != frames || len(pix[0]) != w*h {
+			t.Fatalf("%dx%d parsed as %dx%d at %d/%d", w, h, g.w, g.h, fps.num, fps.den)
 		}
 	}
 }
@@ -144,7 +197,7 @@ func syntheticClip(w, h int) []byte {
 		stamp(g, row, g.w-1, g.h-1, rgb{byte(f + 1), 80, 40})
 		pix[f] = row
 	}
-	return format(g, pix)
+	return format(g, rate{4, 1}, pix)
 }
 
 func stamp(g geo, row []rgb, cx, cy int, col rgb) {
@@ -245,7 +298,7 @@ func TestPredict(t *testing.T) {
 	if !sameFrames(future, again) {
 		t.Fatal("forecast changed between draws")
 	}
-	g, pix, err := parse(original)
+	g, fps, pix, err := parse(original)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -286,7 +339,7 @@ func TestPredict(t *testing.T) {
 	clip = append(clip, pix...)
 	clip = append(clip, future...)
 	path := filepath.Join(t.TempDir(), "future.gif")
-	if err := writeGIF(path, g, clip); err != nil {
+	if err := writeGIF(path, g, clip, centiseconds(fps)); err != nil {
 		t.Fatal(err)
 	}
 	f, err := os.Open(path)
@@ -318,7 +371,7 @@ func TestPredict(t *testing.T) {
 	check(frames-1, 4, 4, pix[frames-1][4*g.w+4])
 	check(frames, 4, 4, future[0][4*g.w+4])
 	for _, d := range decoded.Delay {
-		if d != gifDelay {
+		if d != centiseconds(fps) || d != 25 {
 			t.Fatalf("delay %d", d)
 		}
 	}
@@ -344,7 +397,7 @@ func TestPalette(t *testing.T) {
 		t.Fatal("expected more than 256 colors")
 	}
 	path := filepath.Join(t.TempDir(), "pal.gif")
-	if err := writeGIF(path, g, [][]rgb{exact, busy}); err != nil {
+	if err := writeGIF(path, g, [][]rgb{exact, busy}, centiseconds(rate{4, 1})); err != nil {
 		t.Fatal(err)
 	}
 	f, err := os.Open(path)
