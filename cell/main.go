@@ -6,6 +6,7 @@
 //
 // ffmpeg decodes the video. The default picture is 32x32. -size selects 32,
 // 64, full, or WxH. full keeps the video's own frame size and does not scale.
+// -video selects the file and defaults to DNA cell death and division-L.mp4.
 // Each row is the frame time in seconds followed by the red, green, and blue
 // sample of every pixel in row-major order.
 //
@@ -28,7 +29,10 @@ import (
 	"strings"
 )
 
-const usageText = "usage: cell [-size 32|64|full|WxH] [video] [csv]\n       cell predict [csv] [gif]"
+const (
+	usageText    = "usage: cell [-size 32|64|full|WxH] [-video FILE] [csv]\n       cell predict [csv] [gif]"
+	defaultVideo = "DNA cell death and division-L.mp4"
+)
 
 var ptsTime = regexp.MustCompile(`n:\s*\d+\s+pts:\s*\S+\s+pts_time:([0-9.]+)`)
 
@@ -43,14 +47,11 @@ func run(args []string) error {
 	if len(args) > 0 && args[0] == "predict" {
 		return forecast(args[1:])
 	}
-	sizeSpec, rest, err := splitArgs(args)
+	sizeSpec, videoFlag, rest, err := splitArgs(args)
 	if err != nil {
 		return err
 	}
-	if len(rest) > 2 {
-		return errors.New(usageText)
-	}
-	video, err := videoPath(rest)
+	video, csvArg, err := chooseVideo(videoFlag, rest)
 	if err != nil {
 		return err
 	}
@@ -62,8 +63,8 @@ func run(args []string) error {
 		return fmt.Errorf("size %dx%d is too large to code", w, h)
 	}
 	csvPath := filepath.Join(filepath.Dir(video), csvName(w, h))
-	if len(rest) == 2 {
-		csvPath = rest[1]
+	if csvArg != "" {
+		csvPath = csvArg
 	}
 	times, frames, err := framesOf(video, w, h, native)
 	if err != nil {
@@ -76,21 +77,63 @@ func run(args []string) error {
 	return nil
 }
 
-func splitArgs(args []string) (string, []string, error) {
-	size := "32"
-	var rest []string
+func splitArgs(args []string) (size, video string, rest []string, err error) {
+	size = "32"
 	for i := 0; i < len(args); i++ {
-		if args[i] == "-size" {
+		switch args[i] {
+		case "-size":
 			if i+1 >= len(args) {
-				return "", nil, errors.New(usageText)
+				return "", "", nil, errors.New(usageText)
 			}
 			size = args[i+1]
 			i++
-			continue
+		case "-video":
+			if i+1 >= len(args) {
+				return "", "", nil, errors.New(usageText)
+			}
+			video = args[i+1]
+			i++
+		default:
+			rest = append(rest, args[i])
 		}
-		rest = append(rest, args[i])
 	}
-	return size, rest, nil
+	return size, video, rest, nil
+}
+
+// chooseVideo resolves the input file. -video names it. Otherwise a
+// positional path is the file, and with no path the default clip is used.
+// One positional beside -video is the CSV path.
+func chooseVideo(videoFlag string, rest []string) (video, csvArg string, err error) {
+	if videoFlag != "" {
+		if len(rest) > 1 {
+			return "", "", errors.New(usageText)
+		}
+		if len(rest) == 1 {
+			csvArg = rest[0]
+		}
+		return videoFlag, csvArg, nil
+	}
+	switch len(rest) {
+	case 0:
+		video, err = defaultVideoPath()
+		return video, "", err
+	case 1:
+		return rest[0], "", nil
+	case 2:
+		return rest[0], rest[1], nil
+	default:
+		return "", "", errors.New(usageText)
+	}
+}
+
+func defaultVideoPath() (string, error) {
+	for _, p := range []string{defaultVideo, filepath.Join("cell", defaultVideo)} {
+		info, err := os.Stat(p)
+		if err == nil && !info.IsDir() {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("video %s not found", defaultVideo)
 }
 
 func resolveSize(spec, video string) (w, h int, native bool, err error) {
@@ -148,25 +191,6 @@ func csvName(w, h int) string {
 		return "cell.csv"
 	}
 	return fmt.Sprintf("cell%dx%d.csv", w, h)
-}
-
-func videoPath(args []string) (string, error) {
-	if len(args) >= 1 {
-		return args[0], nil
-	}
-	for _, pattern := range []string{"*.mp4", filepath.Join("cell", "*.mp4")} {
-		matches, err := filepath.Glob(pattern)
-		if err != nil {
-			return "", err
-		}
-		if len(matches) == 1 {
-			return matches[0], nil
-		}
-		if len(matches) > 1 {
-			return "", fmt.Errorf("more than one video matching %s", pattern)
-		}
-	}
-	return "", errors.New("no mp4 file")
 }
 
 // framesOf asks ffmpeg for raw rgb24 frames. native leaves the picture at

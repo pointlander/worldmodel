@@ -13,6 +13,42 @@ import (
 	"testing"
 )
 
+func TestVideoFlag(t *testing.T) {
+	size, video, rest, err := splitArgs([]string{"-video", "other.mp4", "-size", "full", "out.csv"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size != "full" || video != "other.mp4" || len(rest) != 1 || rest[0] != "out.csv" {
+		t.Fatalf("size %q video %q rest %q", size, video, rest)
+	}
+	got, csv, err := chooseVideo(video, rest)
+	if err != nil || got != "other.mp4" || csv != "out.csv" {
+		t.Fatalf("choose %q %q %v", got, csv, err)
+	}
+	got, csv, err = chooseVideo("", nil)
+	if err != nil || csv != "" || filepath.Base(got) != defaultVideo {
+		t.Fatalf("default %q %q %v", got, csv, err)
+	}
+	if _, _, err := chooseVideo("", []string{"clip.mp4", "a.csv", "extra"}); err == nil {
+		t.Fatal("expected usage error")
+	}
+	if _, _, _, err := splitArgs([]string{"-video"}); err == nil {
+		t.Fatal("expected a video path")
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(filepath.Dir(wd)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chdir(wd) })
+	got, err = defaultVideoPath()
+	if err != nil || filepath.Base(got) != defaultVideo {
+		t.Fatalf("default from parent %q %v", got, err)
+	}
+}
+
 func TestRoundTrip(t *testing.T) {
 	original, err := os.ReadFile("cell.csv")
 	if err != nil {
