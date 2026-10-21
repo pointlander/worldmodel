@@ -44,14 +44,26 @@ func forecast(args []string) error {
 	if len(args) >= 2 {
 		gifPath = args[1]
 	}
-	clip := make([][]rgb, 0, frames+half)
+	clip := make([][]rgb, 0, len(pix)+len(future))
 	clip = append(clip, pix...)
 	clip = append(clip, future...)
 	if err := writeGIF(gifPath, g, clip, centiseconds(fps)); err != nil {
 		return err
 	}
-	fmt.Printf("wrote %d source frames and %d predicted frames to %s\n", frames, half, gifPath)
+	fmt.Printf("wrote %d source frames and %d predicted frames to %s\n", len(pix), len(future), gifPath)
 	return nil
+}
+
+// forecastLen is the number of frames Predict draws. A clip at least as long
+// as the canonical file draws 33 frames; a shorter clip draws half of itself.
+func forecastLen(n int) int {
+	if n >= frames {
+		return half
+	}
+	if n < 2 {
+		return 1
+	}
+	return n / 2
 }
 
 func gifName(w, h int) string {

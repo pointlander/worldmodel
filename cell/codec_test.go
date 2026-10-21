@@ -124,7 +124,122 @@ func TestRoundTrip(t *testing.T) {
 	if !bytes.Equal(compressed[4:12], []byte{0, 0, 0, 4, 0, 0, 0, 1}) {
 		t.Fatalf("frame rate %x", compressed[4:12])
 	}
+	if compressed[12] != 0 || compressed[13] != byte(frames) {
+		t.Fatalf("frame count %x", compressed[12:14])
+	}
 	t.Logf("cell.csv: %d -> %d bytes", len(original), len(compressed))
+}
+
+func TestMeshShift(t *testing.T) {
+	g, err := geom(32, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev := make([]rgb, g.pixels)
+	for i := range prev {
+		prev[i] = bg
+	}
+	prev[g.w+2] = rgb{9, 8, 7}
+	vecs := make([][2]int, g.nBlock)
+	for i := range vecs {
+		vecs[i] = [2]int{1, 0}
+	}
+	pix := [][]rgb{prev, nil}
+	if got := predictFrame(g, pix, 1, matSmooth, vecs); got[g.w+3] != (rgb{9, 8, 7}) {
+		t.Fatalf("smooth shift %v", got[g.w+3])
+	}
+	if got := predictFrame(g, pix, 1, matStiff, vecs); got[g.w+3] != (rgb{9, 8, 7}) {
+		t.Fatalf("stiff shift %v", got[g.w+3])
+	}
+	if got := predictFrame(g, pix, 1, matSoft, vecs); got[g.w+3] != (rgb{9, 8, 7}) {
+		t.Fatalf("soft shift %v", got[g.w+3])
+	}
+}
+
+func TestShortClip(t *testing.T) {
+	g, err := geom(8, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []int{4, 5} {
+		pix := make([][]rgb, n)
+		for f := range pix {
+			row := make([]rgb, g.pixels)
+			for i := range row {
+				row[i] = bg
+			}
+			row[f%g.pixels] = rgb{byte(20 + f), 30, 40}
+			pix[f] = row
+		}
+		// An even clip whose second half repeats the first should stay exact.
+		if n%2 == 0 {
+			for f := n / 2; f < n; f++ {
+				pix[f] = append([]rgb(nil), pix[f-n/2]...)
+			}
+		}
+		raw := format(g, rate{30, 1}, pix)
+		blob, err := Compress(raw)
+		if err != nil {
+			t.Fatalf("n=%d compress: %v", n, err)
+		}
+		if int(blob[12])<<8|int(blob[13]) != n {
+			t.Fatalf("n=%d stored %x", n, blob[12:14])
+		}
+		got, err := Decompress(blob)
+		if err != nil || !bytes.Equal(got, raw) {
+			t.Fatalf("n=%d round trip %v", n, err)
+		}
+	}
+}
+
+func TestVideo01(t *testing.T) {
+	const w, h = 64, 36
+	video := "01_video.webm"
+	if _, err := os.Stat(video); err != nil {
+		t.Fatal(err)
+	}
+	fps, err := probeRate(video)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fps != (rate{30, 1}) {
+		t.Fatalf("rate %d/%d", fps.num, fps.den)
+	}
+	decoded, err := framesOf(video, w, h, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded) < 2 {
+		t.Fatalf("frames %d", len(decoded))
+	}
+	times := make([]string, len(decoded))
+	for i := range times {
+		times[i] = frameTime(i, fps)
+	}
+	path := filepath.Join(t.TempDir(), "01.csv")
+	if err := writeCSV(path, w, h, times, decoded); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob, err := Compress(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Decompress(blob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, raw) {
+		t.Fatalf("round trip %d vs %d", len(got), len(raw))
+	}
+	again, err := Compress(raw)
+	if err != nil || !bytes.Equal(again, blob) {
+		t.Fatal("compress is not stable")
+	}
+	t.Logf("01_video %dx%d %d frames: %d -> %d bytes", w, h, len(decoded), len(raw), len(blob))
 }
 
 func TestGeom(t *testing.T) {
@@ -478,6 +593,11 @@ func TestRejects(t *testing.T) {
 	zeroW[0], zeroW[1] = 0, 0
 	if _, err := Decompress(zeroW); err != ErrFormat {
 		t.Fatalf("zero width: %v", err)
+	}
+	zeroN := append([]byte{}, compressed...)
+	zeroN[12], zeroN[13] = 0, 0
+	if _, err := Decompress(zeroN); err != ErrFormat {
+		t.Fatalf("zero frames: %v", err)
 	}
 	if _, err := Compress(original[:len(original)-1]); err != ErrFormat {
 		t.Fatalf("truncated file: %v", err)

@@ -32,8 +32,11 @@ var (
 )
 
 // CompressedSize is the length of the blob for the canonical 32x32 cell.csv.
-// 204765 bits is the shared-luma motion coding, the picture size, and the 4/1 frame rate.
-const CompressedSize = 25596
+const CompressedSize = 25064
+
+// maxSamples bounds a decoded clip. The full-resolution canonical clip is
+// about 30 million samples; a longer file that would not fit is rejected.
+const maxSamples = 32 << 20
 
 // ErrFormat reports an input that is not a canonical cell clip or a blob
 // this model can decode.
@@ -43,20 +46,27 @@ var ErrFormat = errors.New("cell: invalid data")
 // canonical clip is 1.
 var bg = rgb{0, 0, 1}
 
-// The clip is 66 color frames. The time column is the frame index divided
-// by the frame rate, and that rate is stored after the width and the height.
-// On the canonical clip the rate is 4/1, so the times are 0, 0.25, 0.5, 0.75.
-// Block size, search radius, and the width of the counts are functions of
-// the picture size; see geom. Motion is one field for every channel. A zero vector
-// is one bit; any other vector is a zigzag Rice pair. The sample under (x, y)
-// is the previous pixel at (x-dx, y-dy). Off-frame samples are black, which
-// is not the background.
+// A clip is two or more color frames. The time column is the frame index
+// divided by the frame rate. The blob stores the width, the height, the rate,
+// and the frame count. Block size and search radius are functions of the
+// picture size; see geom. Counts are 16 bits when the pixel count fits in a
+// uint16 and 32 bits otherwise.
 //
-// Frame 0 stores the samples that differ from the background. Each later base
-// frame stores the samples that differ from the motion prediction. The second
-// half stores the samples that differ from the first. A difference is a gap
-// into the scan and a zigzag Rice residual. The three channels are separate
-// streams and share the motion field.
+// Frame 0 stores the samples that differ from the background. Each later
+// frame is predicted by a finite-element law. A Markov chain, learned from
+// the laws and the block velocities already coded, proposes the next law and
+// the next velocity of each block. The blob stores only the miss: one bit
+// when the proposal is right, otherwise the law id or the velocity. The laws
+// are the shared table in fea.go. matCopy, legal in the second half of an
+// even-length clip, repeats the paired earlier frame; that is how the
+// 66-frame cycle stays cheap. The sample under (x, y) for a block velocity
+// (dx, dy) is the previous pixel at (x-dx, y-dy). Off-frame samples are
+// black, which is not the background.
+//
+// The residual is the samples that differ from that prediction, a gap into
+// the frame and a zigzag Rice value. The three channels are separate streams
+// and share the motion field. Copy-frame residuals use the half-frame Rice
+// parameters; the other laws use the motion parameters.
 
 type rgb [channels]byte
 
@@ -156,13 +166,15 @@ func headerOf(g geo) string {
 	return b.String()
 }
 
-// Compress packs a canonical cell CSV into its fixed-parameter motion coding.
+// Compress packs a cell CSV. The finite-element law and the block velocities
+// of each frame are the symbols of two Markov chains learned from the frames
+// already coded.
 func Compress(src []byte) ([]byte, error) {
 	g, fps, pix, err := parse(src)
 	if err != nil {
 		return nil, err
 	}
-	var f0, mis, corr [channels]plane
+	var f0 [channels]plane
 	for c := range channels {
 		for p := range g.pixels {
 			if pix[0][p][c] != bg[c] {
@@ -171,61 +183,127 @@ func Compress(src []byte) ([]byte, error) {
 			}
 		}
 	}
-	vecs := motionVecs(g, pix)
-	for f := 1; f < half; f++ {
-		pred := warp(g, pix[f-1], vecs[f-1])
-		for p := range g.pixels {
-			for c := range channels {
-				d := int(pix[f][p][c]) - int(pred[p][c])
-				if d == 0 {
-					continue
-				}
-				mis[c].pos = append(mis[c].pos, (f-1)*g.pixels+p)
-				mis[c].val = append(mis[c].val, d)
-			}
-		}
-	}
-	for f := range half {
-		for p := range g.pixels {
-			for c := range channels {
-				d := int(pix[f+half][p][c]) - int(pix[f][p][c])
-				if d == 0 {
-					continue
-				}
-				corr[c].pos = append(corr[c].pos, f*g.pixels+p)
-				corr[c].val = append(corr[c].val, d)
-			}
-		}
-	}
+	bitsN := countWidth(g.pixels)
 	var w bits
 	w.bits(g.w, 16)
 	w.bits(g.h, 16)
 	w.bits(fps.num, 32)
 	w.bits(fps.den, 32)
+	w.bits(len(pix), 16)
 	for c := range channels {
-		w.bits(len(f0[c].pos), g.countBits)
-	}
-	for c := range channels {
-		w.bits(len(mis[c].pos), g.countBits)
-	}
-	for c := range channels {
-		w.bits(len(corr[c].pos), g.countBits)
+		w.bits(len(f0[c].pos), bitsN)
 	}
 	for c := range channels {
 		writeAbs(&w, &f0[c], kGap0[c], kVal0[c])
 	}
-	for f := range vecs {
-		for _, mv := range vecs[f] {
-			w.vector(mv[0], mv[1])
+	laws := newMatChain()
+	vel := newVecChain(g)
+	for t := 1; t < len(pix); t++ {
+		vecs := searchMV(g, pix[t-1], pix[t])
+		law := chooseLaw(g, pix, t, vecs, laws)
+		writeLaw(&w, laws, law)
+		if law != matCopy {
+			for b, mv := range vecs {
+				writeVec(&w, vel, g, b, mv[0], mv[1])
+			}
+		}
+		pred := predictFrame(g, pix, t, law, vecs)
+		mis := frameResidual(pred, pix[t])
+		kGap, kDel := kGapM, kDelta
+		if law == matCopy {
+			kGap, kDel = kGapH, kDeltaH
+		}
+		for c := range channels {
+			w.bits(len(mis[c].pos), bitsN)
+		}
+		for c := range channels {
+			writeDelta(&w, &mis[c], kGap[c], kDel[c])
 		}
 	}
-	for c := range channels {
-		writeDelta(&w, &mis[c], kGapM[c], kDelta[c])
-	}
-	for c := range channels {
-		writeDelta(&w, &corr[c], kGapH[c], kDeltaH[c])
-	}
 	return w.finish(), nil
+}
+
+func countWidth(n int) int {
+	if n > 65535 {
+		return 32
+	}
+	return 16
+}
+
+func copyLegal(n, t int) bool {
+	return n >= 2 && n%2 == 0 && t >= n/2
+}
+
+func frameResidual(pred, cur []rgb) [channels]plane {
+	var mis [channels]plane
+	for p := range cur {
+		for c := range channels {
+			d := int(cur[p][c]) - int(pred[p][c])
+			if d == 0 {
+				continue
+			}
+			mis[c].pos = append(mis[c].pos, p)
+			mis[c].val = append(mis[c].val, d)
+		}
+	}
+	return mis
+}
+
+func chooseLaw(g geo, pix [][]rgb, t int, vecs [][2]int, laws *matChain) int {
+	best := laws.proposal()
+	if best < 0 || best >= matN || (best == matCopy && !copyLegal(len(pix), t)) {
+		best = matWarp
+	}
+	bestCost := predictCost(g, pix, t, best, vecs)
+	zero := allZero(vecs)
+	for law := range matN {
+		if law == best {
+			continue
+		}
+		if law == matCopy && !copyLegal(len(pix), t) {
+			continue
+		}
+		// A zero field has the same prediction under every motion law, apart
+		// from a law the chain already proposed. Still compare the block warp
+		// so a noisy elastic step cannot win a stationary frame.
+		if zero && law != matCopy && law != matWarp {
+			continue
+		}
+		if c := predictCost(g, pix, t, law, vecs); c < bestCost {
+			best, bestCost = law, c
+		}
+	}
+	return best
+}
+
+func predictCost(g geo, pix [][]rgb, t, law int, vecs [][2]int) int {
+	if law == matCopy {
+		return sad(pix[t], pix[t-len(pix)/2])
+	}
+	return sad(pix[t], predictFrame(g, pix, t, law, vecs))
+}
+
+func sad(a, b []rgb) int {
+	s := 0
+	for i := range a {
+		for c := range channels {
+			d := int(a[i][c]) - int(b[i][c])
+			if d < 0 {
+				d = -d
+			}
+			s += d
+		}
+	}
+	return s
+}
+
+func allZero(vecs [][2]int) bool {
+	for _, v := range vecs {
+		if v[0] != 0 || v[1] != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func writeAbs(w *bits, p *plane, kPos, kVal int) {
@@ -242,14 +320,14 @@ func writeDelta(w *bits, p *plane, kPos, kVal int) {
 	}
 }
 
-// Predict extends a compressed clip by 33 frames.
+// Predict extends a compressed clip by forecastLen frames.
 //
-// Each block's motion vector is a Markov chain learned from the clip.
-// A draw proposes one vector per block; the field actually used is the
-// stored motion field closest to that proposal. Each cell is a plane-stress
-// mesh. Drag pulls its nodes toward the velocity of the block they sit in,
-// and the element stress resists the part of that field that would shear
-// the cell apart.
+// The laws and the block velocities are the same Markov chains the
+// compressor learns. A draw proposes the next law and one velocity per
+// block; the field actually used is the stored motion field closest to
+// that proposal. matCopy repeats an earlier frame of this file, so the
+// forecast draws from the other laws. Each bright cell keeps the mesh built
+// from the last frame, and that mesh advances under the drawn law.
 func Predict(blob []byte) ([][]rgb, error) {
 	raw, err := Decompress(blob)
 	if err != nil {
@@ -259,58 +337,83 @@ func Predict(blob []byte) ([][]rgb, error) {
 	if err != nil {
 		return nil, err
 	}
-	last := pix[frames-1]
+	laws, vel, fields := learnCodec(g, pix)
+	last := pix[len(pix)-1]
 	bodies := components(g, last)
 	meshes := make([]feaMesh, len(bodies))
 	for i := range bodies {
 		meshes[i] = meshOf(g, last, &bodies[i])
 	}
-	trans, marg, fields := learnMotion(g, pix)
-	state := fields[len(fields)-1]
 	rng := lcg(1)
-	out := make([][]rgb, half)
-	zero := vectorID(g, 0, 0)
+	out := make([][]rgb, forecastLen(len(pix)))
 	for f := range out {
+		law := drawLaw(&rng, laws)
 		prop := make([][2]int, g.nBlock)
 		for b := range prop {
-			id := vectorID(g, state[b][0], state[b][1])
-			id = draw(&rng, trans[id], marg, zero)
-			prop[b][0], prop[b][1] = idVector(g, id)
+			prop[b][0], prop[b][1] = idVector(g, drawVec(&rng, vel, b))
 		}
-		mv := nearestField(fields, prop)
+		mv := prop
+		if len(fields) > 0 {
+			mv = nearestField(fields, prop)
+		}
 		for i := range meshes {
-			meshes[i].advanceDriven(1, mv)
+			meshes[i].advanceForecast(law, mv)
 		}
 		out[f] = raster(g, meshes)
-		state = mv
+		laws.follow(law)
+		for b, v := range mv {
+			vel.follow(b, vectorID(g, v[0], v[1]))
+		}
 	}
 	return out, nil
 }
 
-func learnMotion(g geo, pix [][]rgb) ([][]int, []int, [][][2]int) {
-	n := nVec(g)
-	trans := make([][]int, n)
-	for i := range trans {
-		trans[i] = make([]int, n)
-	}
-	marg := make([]int, n)
-	fields := make([][][2]int, 0, frames-1)
-	prev := make([]int, g.nBlock)
-	seen := false
-	for f := 1; f < frames; f++ {
-		mv := searchMV(g, pix[f-1], pix[f])
-		fields = append(fields, mv)
-		for b, v := range mv {
-			id := vectorID(g, v[0], v[1])
-			marg[id]++
-			if seen {
-				trans[prev[b]][id]++
-			}
-			prev[b] = id
+// learnCodec replays the encoder's choices so the forecast chains match the
+// chains that were coded. Copy frames have no velocity field.
+func learnCodec(g geo, pix [][]rgb) (*matChain, *vecChain, [][][2]int) {
+	laws := newMatChain()
+	vel := newVecChain(g)
+	fields := make([][][2]int, 0, len(pix)-1)
+	for t := 1; t < len(pix); t++ {
+		vecs := searchMV(g, pix[t-1], pix[t])
+		law := chooseLaw(g, pix, t, vecs, laws)
+		laws.observe(law)
+		if law == matCopy {
+			continue
 		}
-		seen = true
+		got := make([][2]int, len(vecs))
+		copy(got, vecs)
+		fields = append(fields, got)
+		for b, mv := range vecs {
+			vel.observe(b, vectorID(g, mv[0], mv[1]))
+		}
 	}
-	return trans, marg, fields
+	return laws, vel, fields
+}
+
+func drawLaw(r *lcg, m *matChain) int {
+	row := m.marg
+	if m.seen {
+		row = m.trans[m.prev]
+	}
+	return draw(r, without(row, matCopy), without(m.marg, matCopy), matWarp)
+}
+
+func drawVec(r *lcg, v *vecChain, b int) int {
+	row := v.marg
+	if v.seen {
+		row = v.trans[v.prev[b]]
+	}
+	return draw(r, row, v.marg, v.zero)
+}
+
+func without(row []int, ban int) []int {
+	out := make([]int, len(row))
+	copy(out, row)
+	if ban >= 0 && ban < len(out) {
+		out[ban] = 0
+	}
+	return out
 }
 
 func nearestField(fields [][][2]int, prop [][2]int) [][2]int {
@@ -341,6 +444,181 @@ func vectorID(g geo, dx, dy int) int {
 func idVector(g geo, id int) (int, int) {
 	span := 2*g.mvRange + 1
 	return id%span - g.mvRange, id/span - g.mvRange
+}
+
+// matChain is the first-order model of the finite-element law. The proposal
+// is the mode of the transitions out of the previous law, or the marginal
+// when that row is empty. Ties keep the smaller id.
+type matChain struct {
+	trans [][]int
+	marg  []int
+	prev  int
+	seen  bool
+}
+
+func newMatChain() *matChain {
+	m := &matChain{trans: make([][]int, matN), marg: make([]int, matN)}
+	for i := range m.trans {
+		m.trans[i] = make([]int, matN)
+	}
+	return m
+}
+
+func (m *matChain) proposal() int {
+	if m.seen {
+		if id, ok := modeOf(m.trans[m.prev]); ok {
+			return id
+		}
+	}
+	if id, ok := modeOf(m.marg); ok {
+		return id
+	}
+	return matWarp
+}
+
+func (m *matChain) observe(id int) {
+	m.marg[id]++
+	if m.seen {
+		m.trans[m.prev][id]++
+	}
+	m.prev = id
+	m.seen = true
+}
+
+// follow moves the chain's state without counting the forecast as training.
+func (m *matChain) follow(id int) {
+	m.prev = id
+	m.seen = true
+}
+
+// vecChain is the same model on block velocities. The first frame fills the
+// marginal only, so a velocity has to be seen before it can be proposed.
+type vecChain struct {
+	trans [][]int
+	marg  []int
+	prev  []int
+	zero  int
+	nobs  int
+	seen  bool
+}
+
+func newVecChain(g geo) *vecChain {
+	n := nVec(g)
+	v := &vecChain{
+		trans: make([][]int, n),
+		marg:  make([]int, n),
+		prev:  make([]int, g.nBlock),
+		zero:  vectorID(g, 0, 0),
+	}
+	for i := range v.trans {
+		v.trans[i] = make([]int, n)
+	}
+	for i := range v.prev {
+		v.prev[i] = v.zero
+	}
+	return v
+}
+
+func (v *vecChain) proposal(b int) int {
+	if v.seen {
+		if id, ok := modeOf(v.trans[v.prev[b]]); ok {
+			return id
+		}
+	}
+	if id, ok := modeOf(v.marg); ok {
+		return id
+	}
+	return v.zero
+}
+
+func (v *vecChain) observe(b, id int) {
+	v.marg[id]++
+	if v.seen {
+		v.trans[v.prev[b]][id]++
+	}
+	v.prev[b] = id
+	v.nobs++
+	if v.nobs == len(v.prev) {
+		v.seen = true
+	}
+}
+
+func (v *vecChain) follow(b, id int) {
+	v.prev[b] = id
+}
+
+func modeOf(row []int) (int, bool) {
+	best, n := 0, 0
+	for i, c := range row {
+		n += c
+		if c > row[best] {
+			best = i
+		}
+	}
+	if n == 0 {
+		return 0, false
+	}
+	return best, true
+}
+
+func writeLaw(w *bits, m *matChain, id int) {
+	prop := m.proposal()
+	if id == prop {
+		w.bit(0)
+	} else {
+		w.bit(1)
+		w.rice(zig(id-prop), 0)
+	}
+	m.observe(id)
+}
+
+func readLaw(r *reader, m *matChain) (int, error) {
+	flag, err := r.bit()
+	if err != nil {
+		return 0, err
+	}
+	id := m.proposal()
+	if flag == 1 {
+		z, err := r.rice(0)
+		if err != nil {
+			return 0, err
+		}
+		id += unzig(z)
+	}
+	if id < 0 || id >= matN {
+		return 0, ErrFormat
+	}
+	m.observe(id)
+	return id, nil
+}
+
+func writeVec(w *bits, v *vecChain, g geo, b, dx, dy int) {
+	id := vectorID(g, dx, dy)
+	if id == v.proposal(b) {
+		w.bit(0)
+	} else {
+		w.bit(1)
+		w.vector(dx, dy)
+	}
+	v.observe(b, id)
+}
+
+func readVec(r *reader, v *vecChain, g geo, b int) (int, int, error) {
+	flag, err := r.bit()
+	if err != nil {
+		return 0, 0, err
+	}
+	var dx, dy int
+	if flag == 0 {
+		dx, dy = idVector(g, v.proposal(b))
+	} else {
+		dx, dy, err = r.vector()
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+	v.observe(b, vectorID(g, dx, dy))
+	return dx, dy, nil
 }
 
 // lcg is the fixed generator for the forecast. The multiplier is the
@@ -441,39 +719,33 @@ func Decompress(src []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	n, err := r.bits(16)
+	if err != nil {
+		return nil, err
+	}
 	fps := rate{num: num, den: den}
-	if fps.num <= 0 || fps.den <= 0 {
+	if fps.num <= 0 || fps.den <= 0 || n < 2 {
 		return nil, ErrFormat
 	}
 	g, err := geom(w, h)
 	if err != nil {
 		return nil, err
 	}
-	r.limit = g.baseN
+	if int64(n)*int64(g.pixels) > maxSamples {
+		return nil, ErrFormat
+	}
+	r.limit = g.pixels
 	r.mvRange = g.mvRange
-	var n0, nMis, nHalf [channels]int
+	bitsN := countWidth(g.pixels)
+	var n0 [channels]int
 	for c := range n0 {
-		n, err := r.bits(g.countBits)
+		v, err := r.bits(bitsN)
 		if err != nil {
 			return nil, err
 		}
-		n0[c] = n
+		n0[c] = v
 	}
-	for c := range nMis {
-		n, err := r.bits(g.countBits)
-		if err != nil {
-			return nil, err
-		}
-		nMis[c] = n
-	}
-	for c := range nHalf {
-		n, err := r.bits(g.countBits)
-		if err != nil {
-			return nil, err
-		}
-		nHalf[c] = n
-	}
-	pix := make([][]rgb, frames)
+	pix := make([][]rgb, n)
 	pix[0] = make([]rgb, g.pixels)
 	for p := range pix[0] {
 		pix[0][p] = bg
@@ -483,60 +755,65 @@ func Decompress(src []byte) ([]byte, error) {
 			return nil, err
 		}
 	}
-	vecs := make([][][2]int, half-1)
-	for f := range vecs {
-		vecs[f] = make([][2]int, g.nBlock)
-		for b := range vecs[f] {
-			dx, dy, err := r.vector()
-			if err != nil {
-				return nil, err
-			}
-			vecs[f][b] = [2]int{dx, dy}
-		}
-	}
-	var mis [channels][]hit
-	for c := range channels {
-		hits, err := readHits(&r, nMis[c], kGapM[c], kDelta[c], g.motionN)
+	laws := newMatChain()
+	vel := newVecChain(g)
+	for t := 1; t < n; t++ {
+		law, err := readLaw(&r, laws)
 		if err != nil {
 			return nil, err
 		}
-		mis[c] = hits
-	}
-	// Each prediction is taken from the frame after its residuals are applied.
-	var at [channels]int
-	for dest := 1; dest < half; dest++ {
-		pix[dest] = warp(g, pix[dest-1], vecs[dest-1])
-		for c := range channels {
-			for at[c] < len(mis[c]) && mis[c][at[c]].pos/g.pixels == dest-1 {
-				h := mis[c][at[c]]
-				v, err := addChan(pix[dest][h.pos%g.pixels][c], h.d)
+		if law == matCopy && !copyLegal(n, t) {
+			return nil, ErrFormat
+		}
+		var vecs [][2]int
+		if law != matCopy {
+			vecs = make([][2]int, g.nBlock)
+			for b := range vecs {
+				dx, dy, err := readVec(&r, vel, g, b)
 				if err != nil {
 					return nil, err
 				}
-				pix[dest][h.pos%g.pixels][c] = v
-				at[c]++
+				vecs[b] = [2]int{dx, dy}
 			}
 		}
-	}
-	for c := range channels {
-		if at[c] != len(mis[c]) {
-			return nil, ErrFormat
+		pix[t] = predictFrame(g, pix, t, law, vecs)
+		var nMis [channels]int
+		for c := range nMis {
+			v, err := r.bits(bitsN)
+			if err != nil {
+				return nil, err
+			}
+			nMis[c] = v
 		}
-	}
-	for f := range half {
-		// The second half is a corrected copy. Sharing the slice would
-		// let those corrections overwrite the first half.
-		pix[f+half] = append([]rgb(nil), pix[f]...)
-	}
-	for c := range channels {
-		if err := readDelta(&r, pix, g, c, nHalf[c], kGapH[c], kDeltaH[c], half, g.baseN); err != nil {
-			return nil, err
+		kGap, kDel := kGapM, kDelta
+		if law == matCopy {
+			kGap, kDel = kGapH, kDeltaH
+		}
+		for c := range channels {
+			if err := applyResidual(&r, pix[t], c, nMis[c], kGap[c], kDel[c]); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if err := r.done(); err != nil {
 		return nil, err
 	}
 	return format(g, fps, pix), nil
+}
+
+func applyResidual(r *reader, frame []rgb, c, count, kPos, kVal int) error {
+	hits, err := readHits(r, count, kPos, kVal, len(frame))
+	if err != nil {
+		return err
+	}
+	for _, h := range hits {
+		v, err := addChan(frame[h.pos][c], h.d)
+		if err != nil {
+			return err
+		}
+		frame[h.pos][c] = v
+	}
+	return nil
 }
 
 func readAbs(r *reader, frame []rgb, c, count, kPos, kVal, limit int) error {
@@ -578,46 +855,12 @@ func readHits(r *reader, count, kPos, kVal, limit int) ([]hit, error) {
 	return hits, nil
 }
 
-// readDelta adds zigzag residuals. origin is the frame index of scan position
-// 0, so a second-half residual uses half.
-func readDelta(r *reader, pix [][]rgb, g geo, c, count, kPos, kVal, origin, limit int) error {
-	pos, err := readGaps(r, count, kPos, limit)
-	if err != nil {
-		return err
-	}
-	for _, i := range pos {
-		d, err := r.signed(kVal)
-		if err != nil {
-			return err
-		}
-		f := i/g.pixels + origin
-		p := i % g.pixels
-		if f < 0 || f >= frames {
-			return ErrFormat
-		}
-		v, err := addChan(pix[f][p][c], d)
-		if err != nil {
-			return err
-		}
-		pix[f][p][c] = v
-	}
-	return nil
-}
-
 func addChan(v byte, d int) (byte, error) {
 	n := int(v) + d
 	if uint(n) > 255 {
 		return 0, ErrFormat
 	}
 	return byte(n), nil
-}
-
-func motionVecs(g geo, pix [][]rgb) [][][2]int {
-	vecs := make([][][2]int, half-1)
-	for f := 1; f < half; f++ {
-		vecs[f-1] = searchMV(g, pix[f-1], pix[f])
-	}
-	return vecs
 }
 
 // (dx, dy) is how far the block moved. The sample under (x, y) is the
@@ -814,15 +1057,19 @@ func parse(src []byte) (geo, rate, [][]rgb, error) {
 		return geo{}, rate{}, nil, ErrFormat
 	}
 	lines := bytes.Split(src[:len(src)-1], []byte("\n"))
-	if len(lines) != 1+frames {
+	n := len(lines) - 1
+	if n < 2 || n > 65535 {
 		return geo{}, rate{}, nil, ErrFormat
 	}
 	g, err := headerGeo(lines[0])
 	if err != nil {
 		return geo{}, rate{}, nil, err
 	}
-	times := make([]string, frames)
-	rows := make([][][]byte, frames)
+	if int64(n)*int64(g.pixels) > maxSamples {
+		return geo{}, rate{}, nil, ErrFormat
+	}
+	times := make([]string, n)
+	rows := make([][][]byte, n)
 	for f, line := range lines[1:] {
 		fields := bytes.Split(line, []byte(","))
 		if len(fields) != 1+g.pixels*channels {
@@ -835,7 +1082,7 @@ func parse(src []byte) (geo, rate, [][]rgb, error) {
 	if err != nil {
 		return geo{}, rate{}, nil, err
 	}
-	pix := make([][]rgb, frames)
+	pix := make([][]rgb, n)
 	for f, fields := range rows {
 		pix[f] = make([]rgb, g.pixels)
 		for p := range g.pixels {
@@ -909,7 +1156,7 @@ func format(g geo, fps rate, pix [][]rgb) []byte {
 	var b bytes.Buffer
 	b.WriteString(headerOf(g))
 	b.WriteByte('\n')
-	for f := range frames {
+	for f := range pix {
 		b.WriteString(frameTime(f, fps))
 		for p := range g.pixels {
 			for c := range channels {
