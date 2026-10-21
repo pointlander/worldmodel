@@ -32,7 +32,7 @@ var (
 )
 
 // CompressedSize is the length of the blob for the canonical 32x32 cell.csv.
-const CompressedSize = 25064
+const CompressedSize = 23731
 
 // maxSamples bounds a decoded clip. The full-resolution canonical clip is
 // about 30 million samples; a longer file that would not fit is rejected.
@@ -59,9 +59,14 @@ var bg = rgb{0, 0, 1}
 // when the proposal is right, otherwise the law id or the velocity. The laws
 // are the shared table in fea.go. matCopy, legal in the second half of an
 // even-length clip, repeats the paired earlier frame; that is how the
-// 66-frame cycle stays cheap. The sample under (x, y) for a block velocity
-// (dx, dy) is the previous pixel at (x-dx, y-dy). Off-frame samples are
-// black, which is not the background.
+// 66-frame cycle stays cheap.
+//
+// A block contains one velocity, or smaller blocks, and the smallest block
+// is a pixel. The split flag is written only when the previous frame is
+// both bright and dark inside that rectangle, and a root block also needs
+// the smaller class to cover an eighth of its area. The sample under (x, y)
+// for a leaf velocity (dx, dy) is the previous pixel at (x-dx, y-dy).
+// Off-frame samples are black, which is not the background.
 //
 // The residual is the samples that differ from that prediction, a gap into
 // the frame and a zigzag Rice value. The three channels are separate streams
@@ -78,8 +83,9 @@ type plane struct {
 // geo is the picture layout shared by the encoder and the decoder. It is a
 // function of the width and the height only, so it is not stored past those
 // two sizes. The block is the largest power of two no bigger than a quarter
-// of the short side, and at least 1. The search radius is a quarter of that
-// block and at most 8, which keeps a 32x32 frame on 8x8 blocks of radius 2.
+// of the short side, and at least 1. That block is the root of the tree in
+// tree.go. The search radius is a quarter of that block and at most 8, which
+// keeps a 32x32 frame on 8x8 blocks of radius 2.
 // A block larger than 32 is scored on a lattice of block/8 so the search
 // stays exhaustive, including its tie breaks, at 32 and at 64. Counts are 16
 // bits when both residual scans fit in a uint16, and 32 bits otherwise.
@@ -199,15 +205,16 @@ func Compress(src []byte) ([]byte, error) {
 	laws := newMatChain()
 	vel := newVecChain(g)
 	for t := 1; t < len(pix); t++ {
-		vecs := searchMV(g, pix[t-1], pix[t])
-		law := chooseLaw(g, pix, t, vecs, laws)
+		trees := fitFrame(g, pix[t-1], pix[t], vel)
+		law := chooseLaw(g, pix, t, trees, laws)
 		writeLaw(&w, laws, law)
 		if law != matCopy {
-			for b, mv := range vecs {
-				writeVec(&w, vel, g, b, mv[0], mv[1])
+			for _, b := range trees {
+				writeTree(&w, vel, g, pix[t-1], b, true)
 			}
+			vel.endFrame()
 		}
-		pred := predictFrame(g, pix, t, law, vecs)
+		pred := predictTrees(g, pix, t, law, trees)
 		mis := frameResidual(pred, pix[t])
 		kGap, kDel := kGapM, kDelta
 		if law == matCopy {
@@ -249,13 +256,13 @@ func frameResidual(pred, cur []rgb) [channels]plane {
 	return mis
 }
 
-func chooseLaw(g geo, pix [][]rgb, t int, vecs [][2]int, laws *matChain) int {
+func chooseLaw(g geo, pix [][]rgb, t int, trees []blk, laws *matChain) int {
 	best := laws.proposal()
 	if best < 0 || best >= matN || (best == matCopy && !copyLegal(len(pix), t)) {
 		best = matWarp
 	}
-	bestCost := predictCost(g, pix, t, best, vecs)
-	zero := allZero(vecs)
+	bestCost := predictCost(g, pix, t, best, trees)
+	zero := treesZero(trees)
 	for law := range matN {
 		if law == best {
 			continue
@@ -269,18 +276,18 @@ func chooseLaw(g geo, pix [][]rgb, t int, vecs [][2]int, laws *matChain) int {
 		if zero && law != matCopy && law != matWarp {
 			continue
 		}
-		if c := predictCost(g, pix, t, law, vecs); c < bestCost {
+		if c := predictCost(g, pix, t, law, trees); c < bestCost {
 			best, bestCost = law, c
 		}
 	}
 	return best
 }
 
-func predictCost(g geo, pix [][]rgb, t, law int, vecs [][2]int) int {
+func predictCost(g geo, pix [][]rgb, t, law int, trees []blk) int {
 	if law == matCopy {
 		return sad(pix[t], pix[t-len(pix)/2])
 	}
-	return sad(pix[t], predictFrame(g, pix, t, law, vecs))
+	return sad(pix[t], predictTrees(g, pix, t, law, trees))
 }
 
 func sad(a, b []rgb) int {
@@ -295,15 +302,6 @@ func sad(a, b []rgb) int {
 		}
 	}
 	return s
-}
-
-func allZero(vecs [][2]int) bool {
-	for _, v := range vecs {
-		if v[0] != 0 || v[1] != 0 {
-			return false
-		}
-	}
-	return true
 }
 
 func writeAbs(w *bits, p *plane, kPos, kVal int) {
@@ -324,7 +322,7 @@ func writeDelta(w *bits, p *plane, kPos, kVal int) {
 //
 // The laws and the block velocities are the same Markov chains the
 // compressor learns. A draw proposes the next law and one velocity per
-// block; the field actually used is the stored motion field closest to
+// top-level block; the tree actually used is the stored tree closest to
 // that proposal. matCopy repeats an earlier frame of this file, so the
 // forecast draws from the other laws. Each bright cell keeps the mesh built
 // from the last frame, and that mesh advances under the drawn law.
@@ -345,48 +343,48 @@ func Predict(blob []byte) ([][]rgb, error) {
 		meshes[i] = meshOf(g, last, &bodies[i])
 	}
 	rng := lcg(1)
+	tops := tiles(g)
 	out := make([][]rgb, forecastLen(len(pix)))
 	for f := range out {
 		law := drawLaw(&rng, laws)
-		prop := make([][2]int, g.nBlock)
-		for b := range prop {
-			prop[b][0], prop[b][1] = idVector(g, drawVec(&rng, vel, b))
+		prop := make([][2]int, len(tops))
+		for b, r := range tops {
+			prop[b][0], prop[b][1] = idVector(g, drawVec(&rng, vel, r.y*g.w+r.x))
 		}
-		mv := prop
+		trees := flatField(g, prop)
 		if len(fields) > 0 {
-			mv = nearestField(fields, prop)
+			trees = nearestTrees(fields, prop)
 		}
 		for i := range meshes {
-			meshes[i].advanceForecast(law, mv)
+			meshes[i].advanceForecast(law, trees)
 		}
 		out[f] = raster(g, meshes)
 		laws.follow(law)
-		for b, v := range mv {
-			vel.follow(b, vectorID(g, v[0], v[1]))
-		}
+		eachLeaf(trees, func(b blk) {
+			vel.follow(b.y*g.w+b.x, vectorID(g, b.dx, b.dy))
+		})
 	}
 	return out, nil
 }
 
 // learnCodec replays the encoder's choices so the forecast chains match the
 // chains that were coded. Copy frames have no velocity field.
-func learnCodec(g geo, pix [][]rgb) (*matChain, *vecChain, [][][2]int) {
+func learnCodec(g geo, pix [][]rgb) (*matChain, *vecChain, [][]blk) {
 	laws := newMatChain()
 	vel := newVecChain(g)
-	fields := make([][][2]int, 0, len(pix)-1)
+	fields := make([][]blk, 0, len(pix)-1)
 	for t := 1; t < len(pix); t++ {
-		vecs := searchMV(g, pix[t-1], pix[t])
-		law := chooseLaw(g, pix, t, vecs, laws)
+		trees := fitFrame(g, pix[t-1], pix[t], vel)
+		law := chooseLaw(g, pix, t, trees, laws)
 		laws.observe(law)
 		if law == matCopy {
 			continue
 		}
-		got := make([][2]int, len(vecs))
-		copy(got, vecs)
-		fields = append(fields, got)
-		for b, mv := range vecs {
-			vel.observe(b, vectorID(g, mv[0], mv[1]))
+		fields = append(fields, trees)
+		for _, b := range trees {
+			noteTree(vel, g, b)
 		}
+		vel.endFrame()
 	}
 	return laws, vel, fields
 }
@@ -413,26 +411,6 @@ func without(row []int, ban int) []int {
 	if ban >= 0 && ban < len(out) {
 		out[ban] = 0
 	}
-	return out
-}
-
-func nearestField(fields [][][2]int, prop [][2]int) [][2]int {
-	best := 0
-	bestH, bestL := len(prop)+1, 0
-	for i, f := range fields {
-		h, l := 0, 0
-		for b := range f {
-			if f[b] != prop[b] {
-				h++
-			}
-			l += iabs(f[b][0]-prop[b][0]) + iabs(f[b][1]-prop[b][1])
-		}
-		if h < bestH || (h == bestH && l < bestL) {
-			bestH, bestL, best = h, l, i
-		}
-	}
-	out := make([][2]int, len(fields[best]))
-	copy(out, fields[best])
 	return out
 }
 
@@ -491,14 +469,15 @@ func (m *matChain) follow(id int) {
 	m.seen = true
 }
 
-// vecChain is the same model on block velocities. The first frame fills the
-// marginal only, so a velocity has to be seen before it can be proposed.
+// vecChain is the same model on block velocities. A leaf keeps its state at
+// the pixel where that leaf starts, so a block and the pixels inside it do
+// not share a slot. The first motion frame fills the marginal only; seen
+// flips after that frame, not after a fixed number of leaves.
 type vecChain struct {
 	trans [][]int
 	marg  []int
 	prev  []int
 	zero  int
-	nobs  int
 	seen  bool
 }
 
@@ -507,7 +486,7 @@ func newVecChain(g geo) *vecChain {
 	v := &vecChain{
 		trans: make([][]int, n),
 		marg:  make([]int, n),
-		prev:  make([]int, g.nBlock),
+		prev:  make([]int, g.pixels),
 		zero:  vectorID(g, 0, 0),
 	}
 	for i := range v.trans {
@@ -519,9 +498,9 @@ func newVecChain(g geo) *vecChain {
 	return v
 }
 
-func (v *vecChain) proposal(b int) int {
+func (v *vecChain) proposal(origin int) int {
 	if v.seen {
-		if id, ok := modeOf(v.trans[v.prev[b]]); ok {
+		if id, ok := modeOf(v.trans[v.prev[origin]]); ok {
 			return id
 		}
 	}
@@ -531,20 +510,20 @@ func (v *vecChain) proposal(b int) int {
 	return v.zero
 }
 
-func (v *vecChain) observe(b, id int) {
+func (v *vecChain) observe(origin, id int) {
 	v.marg[id]++
 	if v.seen {
-		v.trans[v.prev[b]][id]++
+		v.trans[v.prev[origin]][id]++
 	}
-	v.prev[b] = id
-	v.nobs++
-	if v.nobs == len(v.prev) {
-		v.seen = true
-	}
+	v.prev[origin] = id
 }
 
-func (v *vecChain) follow(b, id int) {
-	v.prev[b] = id
+func (v *vecChain) endFrame() {
+	v.seen = true
+}
+
+func (v *vecChain) follow(origin, id int) {
+	v.prev[origin] = id
 }
 
 func modeOf(row []int) (int, bool) {
@@ -765,18 +744,20 @@ func Decompress(src []byte) ([]byte, error) {
 		if law == matCopy && !copyLegal(n, t) {
 			return nil, ErrFormat
 		}
-		var vecs [][2]int
+		var trees []blk
 		if law != matCopy {
-			vecs = make([][2]int, g.nBlock)
-			for b := range vecs {
-				dx, dy, err := readVec(&r, vel, g, b)
+			parts := tiles(g)
+			trees = make([]blk, len(parts))
+			for i, rc := range parts {
+				b, err := readTree(&r, vel, g, pix[t-1], rc, true)
 				if err != nil {
 					return nil, err
 				}
-				vecs[b] = [2]int{dx, dy}
+				trees[i] = b
 			}
+			vel.endFrame()
 		}
-		pix[t] = predictFrame(g, pix, t, law, vecs)
+		pix[t] = predictTrees(g, pix, t, law, trees)
 		var nMis [channels]int
 		for c := range nMis {
 			v, err := r.bits(bitsN)
@@ -863,23 +844,6 @@ func addChan(v byte, d int) (byte, error) {
 	return byte(n), nil
 }
 
-// (dx, dy) is how far the block moved. The sample under (x, y) is the
-// previous pixel at (x-dx, y-dy); off-frame samples are black.
-func predAt(g geo, src []rgb, vecs [][2]int, p int) rgb {
-	y, x := p/g.w, p%g.w
-	b := (y/g.block)*g.gridX + x/g.block
-	dx, dy := vecs[b][0], vecs[b][1]
-	return sample(g, src, x-dx, y-dy)
-}
-
-func warp(g geo, src []rgb, mv [][2]int) []rgb {
-	dst := make([]rgb, g.pixels)
-	for p := range dst {
-		dst[p] = predAt(g, src, mv, p)
-	}
-	return dst
-}
-
 func sample(g geo, src []rgb, x, y int) rgb {
 	if uint(x) >= uint(g.w) || uint(y) >= uint(g.h) {
 		return rgb{}
@@ -892,41 +856,15 @@ func luma(p rgb) int {
 	return (19595*int(p[0]) + 38470*int(p[1]) + 7471*int(p[2]) + 32768) >> 16
 }
 
-func searchMV(g geo, prev, cur []rgb) [][2]int {
-	out := make([][2]int, g.nBlock)
-	b := 0
-	for by := 0; by < g.h; by += g.block {
-		for bx := 0; bx < g.w; bx += g.block {
-			bw, bh := g.block, g.block
-			if bx+bw > g.w {
-				bw = g.w - bx
-			}
-			if by+bh > g.h {
-				bh = g.h - by
-			}
-			bestMis := bw*bh + 1
-			var bestDX, bestDY int
-			for oy := -g.mvRange; oy <= g.mvRange; oy++ {
-				for ox := -g.mvRange; ox <= g.mvRange; ox++ {
-					mis := blockMiss(g, prev, cur, bx, by, bw, bh, ox, oy)
-					if lessMV(mis, ox, oy, bestMis, bestDX, bestDY) {
-						bestMis = mis
-						bestDX, bestDY = ox, oy
-					}
-				}
-			}
-			out[b] = [2]int{bestDX, bestDY}
-			b++
-		}
-	}
-	return out
-}
-
 func blockMiss(g geo, prev, cur []rgb, bx, by, bw, bh, dx, dy int) int {
 	mis := 0
-	for y := by; y < by+bh; y += g.stride {
+	step := g.stride
+	if step > bw || step > bh {
+		step = 1
+	}
+	for y := by; y < by+bh; y += step {
 		row := y * g.w
-		for x := bx; x < bx+bw; x += g.stride {
+		for x := bx; x < bx+bw; x += step {
 			p := sample(g, prev, x-dx, y-dy)
 			c := cur[row+x]
 			if (luma(p) > 1) != (luma(c) > 1) {

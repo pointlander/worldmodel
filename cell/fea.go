@@ -221,8 +221,9 @@ func (m *feaMesh) coastLaw(time float64, law feaLaw) {
 
 // advanceForecast applies one of the compressor's laws for one frame.
 // The rest shape is reset to the current shape first, so strain does not
-// accumulate across the forecast. matCopy is not a motion law.
-func (m *feaMesh) advanceForecast(law int, mv [][2]int) {
+// accumulate across the forecast. matCopy is not a motion law. A node takes
+// the root block's velocity, which is the mean of that block's leaves.
+func (m *feaMesh) advanceForecast(law int, trees []blk) {
 	for i := range m.nodes {
 		n := &m.nodes[i]
 		n.X, n.Y = n.x, n.y
@@ -230,34 +231,54 @@ func (m *feaMesh) advanceForecast(law int, mv [][2]int) {
 	}
 	switch law {
 	case matHalf:
-		m.translate(mv, 0.5)
+		m.translate(trees, 0.5)
 	case matSoft:
-		m.setVelocity(mv)
+		m.setVelocity(trees)
 		m.coastLaw(1, lawSoft)
 	case matStiff:
-		m.setVelocity(mv)
+		m.setVelocity(trees)
 		m.coastLaw(1, lawStiff)
 	default:
-		m.translate(mv, 1)
+		m.translate(trees, 1)
 	}
 }
 
-func (m *feaMesh) translate(mv [][2]int, scale float64) {
+func (m *feaMesh) translate(trees []blk, scale float64) {
 	for i := range m.nodes {
 		n := &m.nodes[i]
-		b := m.blockAt(n.x, n.y)
-		n.x += scale * float64(mv[b][0])
-		n.y += scale * float64(mv[b][1])
+		px, py := nodePixel(m.g, n.x, n.y)
+		dx, dy := blockVel(m.g, trees, px, py)
+		n.x += scale * float64(dx)
+		n.y += scale * float64(dy)
 	}
 }
 
-func (m *feaMesh) setVelocity(mv [][2]int) {
+func (m *feaMesh) setVelocity(trees []blk) {
 	for i := range m.nodes {
 		n := &m.nodes[i]
-		b := m.blockAt(n.x, n.y)
-		n.vx = float64(mv[b][0])
-		n.vy = float64(mv[b][1])
+		px, py := nodePixel(m.g, n.x, n.y)
+		dx, dy := blockVel(m.g, trees, px, py)
+		n.vx = float64(dx)
+		n.vy = float64(dy)
 	}
+}
+
+func nodePixel(g geo, x, y float64) (int, int) {
+	ix := int(x)
+	iy := int(y)
+	if ix < 0 {
+		ix = 0
+	}
+	if iy < 0 {
+		iy = 0
+	}
+	if ix >= g.w {
+		ix = g.w - 1
+	}
+	if iy >= g.h {
+		iy = g.h - 1
+	}
+	return ix, iy
 }
 
 // advanceDriven integrates the mesh for time frames. When mv is set, drag
@@ -411,30 +432,35 @@ func max3(a, b, c float64) float64 {
 	return a
 }
 
-// predictFrame is the inter-frame model shared by the encoder and the decoder.
-// matCopy reads the frame one half-clip earlier. The other laws deform a grid
-// of linear triangles and sample the previous frame through that mesh.
+// predictFrame is the flat-field entry used by tests. Each top-level block
+// is one leaf. predictTrees is the encoder and the decoder: matWarp samples
+// the leaf that contains the pixel, and the mesh laws use the mean velocity
+// of that block's leaves. matCopy reads the frame one half-clip earlier.
 func predictFrame(g geo, pix [][]rgb, t, mat int, vecs [][2]int) []rgb {
+	return predictTrees(g, pix, t, mat, flatField(g, vecs))
+}
+
+func predictTrees(g geo, pix [][]rgb, t, mat int, trees []blk) []rgb {
 	if mat == matCopy {
 		return append([]rgb(nil), pix[t-len(pix)/2]...)
 	}
 	prev := pix[t-1]
 	switch mat {
 	case matSmooth:
-		return warpMesh(g, prev, vecs, 1)
+		return warpMesh(g, prev, meansOf(trees), 1)
 	case matHalf:
-		return warpMesh(g, prev, vecs, 0.5)
+		return warpMesh(g, prev, meansOf(trees), 0.5)
 	case matSoft:
-		return warpElastic(g, prev, vecs, lawSoft)
+		return warpElastic(g, prev, meansOf(trees), lawSoft)
 	case matStiff:
-		return warpElastic(g, prev, vecs, lawStiff)
+		return warpElastic(g, prev, meansOf(trees), lawStiff)
 	default:
-		return warp(g, prev, vecs)
+		return warpTrees(g, prev, trees)
 	}
 }
 
-func warpMesh(g geo, prev []rgb, vecs [][2]int, scale float64) []rgb {
-	vx, vy := nodeVelocity(g, vecs)
+func warpMesh(g geo, prev []rgb, means [][2]float64, scale float64) []rgb {
+	vx, vy := nodeVelocity(g, means)
 	for i := range vx {
 		vx[i] *= scale
 		vy[i] *= scale
@@ -442,8 +468,8 @@ func warpMesh(g geo, prev []rgb, vecs [][2]int, scale float64) []rgb {
 	return sampleMesh(g, prev, vx, vy)
 }
 
-func warpElastic(g geo, prev []rgb, vecs [][2]int, law feaLaw) []rgb {
-	m := gridMesh(g, vecs)
+func warpElastic(g geo, prev []rgb, means [][2]float64, law feaLaw) []rgb {
+	m := gridMesh(g, means)
 	m.coastLaw(1, law)
 	dx := make([]float64, len(m.nodes))
 	dy := make([]float64, len(m.nodes))
@@ -456,10 +482,10 @@ func warpElastic(g geo, prev []rgb, vecs [][2]int, law feaLaw) []rgb {
 
 // gridMesh is the block lattice as two triangles per block. Each node's
 // velocity is the mean of the block vectors that meet there.
-func gridMesh(g geo, vecs [][2]int) feaMesh {
+func gridMesh(g geo, means [][2]float64) feaMesh {
 	nx, ny := g.gridX+1, g.gridY+1
 	m := feaMesh{g: g, nodes: make([]feaNode, nx*ny)}
-	vx, vy := nodeVelocity(g, vecs)
+	vx, vy := nodeVelocity(g, means)
 	for j := 0; j < ny; j++ {
 		for i := 0; i < nx; i++ {
 			x, y := nodeRest(g, i, j)
@@ -496,14 +522,14 @@ func nodeRest(g geo, i, j int) (float64, float64) {
 	return float64(x), float64(y)
 }
 
-func nodeVelocity(g geo, vecs [][2]int) (vx, vy []float64) {
+func nodeVelocity(g geo, means [][2]float64) (vx, vy []float64) {
 	nx, ny := g.gridX+1, g.gridY+1
 	vx = make([]float64, nx*ny)
 	vy = make([]float64, nx*ny)
 	cnt := make([]int, nx*ny)
 	for j := 0; j < g.gridY; j++ {
 		for i := 0; i < g.gridX; i++ {
-			dx, dy := float64(vecs[j*g.gridX+i][0]), float64(vecs[j*g.gridX+i][1])
+			dx, dy := means[j*g.gridX+i][0], means[j*g.gridX+i][1]
 			for _, k := range []int{j*nx + i, j*nx + i + 1, (j+1)*nx + i, (j+1)*nx + i + 1} {
 				vx[k] += dx
 				vy[k] += dy

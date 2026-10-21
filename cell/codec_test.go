@@ -267,6 +267,100 @@ func TestGeom(t *testing.T) {
 	}
 }
 
+func TestRecursiveBlocks(t *testing.T) {
+	q := quadrants(rect{0, 0, 2, 2})
+	if len(q) != 4 || q[0] != (rect{0, 0, 1, 1}) || q[1] != (rect{1, 0, 1, 1}) ||
+		q[2] != (rect{0, 1, 1, 1}) || q[3] != (rect{1, 1, 1, 1}) {
+		t.Fatalf("quadrants %v", q)
+	}
+	if got := quadrants(rect{0, 0, 1, 4}); len(got) != 2 || got[0].h != 2 || got[1].y != 2 {
+		t.Fatalf("column split %v", got)
+	}
+	g, err := geom(8, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.block != 2 {
+		t.Fatalf("block %d", g.block)
+	}
+	prev := make([]rgb, g.pixels)
+	cur := make([]rgb, g.pixels)
+	for i := range prev {
+		prev[i] = bg
+		cur[i] = bg
+	}
+	white := rgb{255, 255, 255}
+	prev[0] = white
+	prev[1] = white
+	cur[1] = white
+	cur[g.w] = white
+	trees := fitFrame(g, prev, cur, newVecChain(g))
+	if !trees[0].split || !hasPixel(trees[0]) {
+		t.Fatalf("mixed block did not reach a pixel: %+v", trees[0])
+	}
+	if trees[1].split {
+		t.Fatal("uniform block split")
+	}
+	pix := [][]rgb{
+		prev, cur,
+		append([]rgb(nil), prev...),
+		append([]rgb(nil), cur...),
+	}
+	raw := format(g, rate{30, 1}, pix)
+	blob, err := Compress(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Decompress(blob)
+	if err != nil || !bytes.Equal(got, raw) {
+		t.Fatalf("round trip %v", err)
+	}
+
+	original, err := os.ReadFile("cell.csv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cg, _, pix, err := parse(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vel := newVecChain(cg)
+	laws := newMatChain()
+	splits, pixels := 0, 0
+	var walk func(blk)
+	walk = func(b blk) {
+		if !b.split {
+			if b.w == 1 && b.h == 1 {
+				pixels++
+			}
+			return
+		}
+		splits++
+		for _, k := range b.sub {
+			walk(k)
+		}
+	}
+	for t := 1; t < len(pix); t++ {
+		trees = fitFrame(cg, pix[t-1], pix[t], vel)
+		law := chooseLaw(cg, pix, t, trees, laws)
+		laws.observe(law)
+		if law == matCopy {
+			continue
+		}
+		for _, b := range trees {
+			walk(b)
+		}
+		for _, b := range trees {
+			noteTree(vel, cg, b)
+		}
+		vel.endFrame()
+	}
+	if splits == 0 || pixels == 0 {
+		t.Fatalf("canonical tree splits %d pixel leaves %d", splits, pixels)
+	}
+	t.Logf("canonical tree splits %d pixel leaves %d", splits, pixels)
+}
+
 func TestOtherSizes(t *testing.T) {
 	for _, wh := range [][2]int{{16, 16}, {40, 30}, {45, 45}, {64, 64}, {260, 256}} {
 		w, h := wh[0], wh[1]
