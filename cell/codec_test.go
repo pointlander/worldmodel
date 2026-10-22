@@ -294,7 +294,7 @@ func TestRecursiveBlocks(t *testing.T) {
 	prev[1] = white
 	cur[1] = white
 	cur[g.w] = white
-	trees := fitFrame(g, prev, cur, newVecChain(g))
+	trees := fitFrame(g, prev, cur, newVecChain(g), false)
 	if !trees[0].split || !hasPixel(trees[0]) {
 		t.Fatalf("mixed block did not reach a pixel: %+v", trees[0])
 	}
@@ -341,8 +341,7 @@ func TestRecursiveBlocks(t *testing.T) {
 		}
 	}
 	for t := 1; t < len(pix); t++ {
-		trees = fitFrame(cg, pix[t-1], pix[t], vel)
-		law := chooseLaw(cg, pix, t, trees, laws)
+		trees, law := fitCoded(cg, pix, t, vel, laws)
 		laws.observe(law)
 		if law == matCopy {
 			continue
@@ -359,6 +358,70 @@ func TestRecursiveBlocks(t *testing.T) {
 		t.Fatalf("canonical tree splits %d pixel leaves %d", splits, pixels)
 	}
 	t.Logf("canonical tree splits %d pixel leaves %d", splits, pixels)
+}
+
+func TestColorSplit(t *testing.T) {
+	g, err := geom(16, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.block != 4 {
+		t.Fatalf("block %d", g.block)
+	}
+	prev := make([]rgb, g.pixels)
+	cur := make([]rgb, g.pixels)
+	for i := range prev {
+		prev[i] = bg
+		cur[i] = bg
+	}
+	red := rgb{255, 0, 0}
+	blue := rgb{0, 0, 255}
+	prev[0], prev[1] = red, red
+	prev[g.w], prev[g.w+1] = blue, blue
+	cur[1], cur[2] = red, red
+	cur[2*g.w], cur[2*g.w+1] = blue, blue
+
+	color := rect{0, 0, 2, 2}
+	if candidate(g, prev, color, true, true) {
+		t.Fatal("root opened on color alone")
+	}
+	if !candidate(g, prev, color, false, true) {
+		t.Fatal("two-color child stayed shut")
+	}
+	if candidate(g, prev, color, false, false) {
+		t.Fatal("mesh frame opened on color")
+	}
+	flat := append([]rgb(nil), prev...)
+	flat[0], flat[1] = rgb{40, 0, 0}, rgb{71, 0, 0}
+	flat[g.w], flat[g.w+1] = rgb{40, 0, 0}, rgb{71, 0, 0}
+	if candidate(g, flat, color, false, true) {
+		t.Fatal("span 31 opened a child")
+	}
+	flat[1], flat[g.w+1] = rgb{72, 0, 0}, rgb{72, 0, 0}
+	if !candidate(g, flat, color, false, true) {
+		t.Fatal("span 32 stayed shut")
+	}
+	if candidate(g, flat, color, true, true) {
+		t.Fatal("root opened on color alone")
+	}
+
+	trees := fitFrame(g, prev, cur, newVecChain(g), true)
+	if !trees[0].split {
+		t.Fatal("silhouette root stayed whole")
+	}
+	if !trees[0].sub[0].split || !hasPixel(trees[0].sub[0]) {
+		t.Fatalf("color child %+v", trees[0].sub[0])
+	}
+	pix := [][]rgb{prev, cur}
+	raw := format(g, rate{30, 1}, pix)
+	blob, err := Compress(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Decompress(blob)
+	if err != nil || !bytes.Equal(got, raw) {
+		t.Fatalf("round trip %v", err)
+	}
 }
 
 func TestOtherSizes(t *testing.T) {

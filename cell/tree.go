@@ -5,12 +5,16 @@
 package main
 
 // A block is one velocity, or it contains smaller blocks. The smallest
-// block is a pixel. Both sides agree on where a split is even possible:
-// the rectangle in the previous frame must contain a bright sample and a
-// dark one, and it must be larger than a pixel. A root block also needs
-// the smaller class to cover at least an eighth of its area, so a speck
-// does not buy a flag. One flag there chooses the split. A tie keeps the
-// single velocity.
+// block is a pixel. Both sides agree on where a split is even possible.
+// A root opens when the previous frame is both bright and dark and the
+// smaller class covers at least an eighth of the block, so a speck does
+// not buy a flag. A block inside that split also opens when it holds two
+// colors and this frame is a block warp: the mesh laws move by the mean of
+// the leaves, so an interior flag would have nothing to predict. One flag
+// chooses the split. A tie keeps the single velocity.
+//
+// colorSpan is the channel gap that counts as a second color. The root
+// does not use it: a microscopy field would flag every block.
 
 type rect struct {
 	x, y, w, h int
@@ -65,10 +69,22 @@ func quadrants(r rect) []rect {
 	return out
 }
 
-func candidate(g geo, prev []rgb, r rect, root bool) bool {
+const colorSpan = 32
+
+func candidate(g geo, prev []rgb, r rect, root, color bool) bool {
 	if r.w < 2 && r.h < 2 {
 		return false
 	}
+	if maskSplit(g, prev, r, root) {
+		return true
+	}
+	if root || !color {
+		return false
+	}
+	return twoColors(g, prev, r)
+}
+
+func maskSplit(g geo, prev []rgb, r rect, root bool) bool {
 	bright, dark := 0, 0
 	for y := r.y; y < r.y+r.h; y++ {
 		row := y * g.w
@@ -83,18 +99,58 @@ func candidate(g geo, prev []rgb, r rect, root bool) bool {
 	if bright == 0 || dark == 0 {
 		return false
 	}
-	// A root flag is not worth writing for a speck of the other class.
-	// Children of a real split may still refine down to a pixel.
-	if root {
-		minor := bright
-		if dark < minor {
-			minor = dark
-		}
-		if minor*8 < r.w*r.h {
-			return false
+	if !root {
+		return true
+	}
+	minor := bright
+	if dark < minor {
+		minor = dark
+	}
+	return minor*8 >= r.w*r.h
+}
+
+// twoColors reports that the widest channel spans colorSpan and both sides
+// of its midpoint are occupied. A single shade does not open a flag.
+func twoColors(g geo, prev []rgb, r rect) bool {
+	lo := [channels]int{255, 255, 255}
+	hi := [channels]int{}
+	for y := r.y; y < r.y+r.h; y++ {
+		row := y * g.w
+		for x := r.x; x < r.x+r.w; x++ {
+			p := prev[row+x]
+			for c := range channels {
+				v := int(p[c])
+				if v < lo[c] {
+					lo[c] = v
+				}
+				if v > hi[c] {
+					hi[c] = v
+				}
+			}
 		}
 	}
-	return true
+	ch, span := 0, 0
+	for c := range channels {
+		if hi[c]-lo[c] > span {
+			span = hi[c] - lo[c]
+			ch = c
+		}
+	}
+	if span < colorSpan {
+		return false
+	}
+	mid := (lo[ch] + hi[ch]) / 2
+	below := 0
+	for y := r.y; y < r.y+r.h; y++ {
+		row := y * g.w
+		for x := r.x; x < r.x+r.w; x++ {
+			if int(prev[row+x][ch]) <= mid {
+				below++
+			}
+		}
+	}
+	area := r.w * r.h
+	return below > 0 && below < area
 }
 
 func flatField(g geo, vecs [][2]int) []blk {
@@ -109,16 +165,16 @@ func flatField(g geo, vecs [][2]int) []blk {
 	return out
 }
 
-func fitFrame(g geo, prev, cur []rgb, vel *vecChain) []blk {
+func fitFrame(g geo, prev, cur []rgb, vel *vecChain, color bool) []blk {
 	parts := tiles(g)
 	out := make([]blk, len(parts))
 	for i, r := range parts {
-		out[i] = fitNode(g, prev, cur, vel, r, true)
+		out[i] = fitNode(g, prev, cur, vel, r, true, color)
 	}
 	return out
 }
 
-func fitNode(g geo, prev, cur []rgb, vel *vecChain, r rect, root bool) blk {
+func fitNode(g geo, prev, cur []rgb, vel *vecChain, r rect, root, color bool) blk {
 	var dx, dy int
 	if root {
 		dx, dy = searchRect(g, prev, cur, r)
@@ -126,7 +182,7 @@ func fitNode(g geo, prev, cur []rgb, vel *vecChain, r rect, root bool) blk {
 		dx, dy = searchBits(g, prev, cur, r)
 	}
 	leaf := blk{rect: r, dx: dx, dy: dy}
-	if !candidate(g, prev, r, root) {
+	if !candidate(g, prev, r, root, color) {
 		return leaf
 	}
 	// A perfect cheap leaf cannot be beaten by two or more child velocities.
@@ -137,24 +193,24 @@ func fitNode(g geo, prev, cur []rgb, vel *vecChain, r rect, root bool) blk {
 	kids := make([]blk, len(parts))
 	split := blk{rect: r, split: true, sub: kids}
 	for i, p := range parts {
-		kids[i] = fitNode(g, prev, cur, vel, p, false)
+		kids[i] = fitNode(g, prev, cur, vel, p, false, color)
 	}
-	if treeCost(g, prev, cur, vel, split, root) < treeCost(g, prev, cur, vel, leaf, root) {
+	if treeCost(g, prev, cur, vel, split, root, color) < treeCost(g, prev, cur, vel, leaf, root, color) {
 		return split
 	}
 	return leaf
 }
 
-func treeCost(g geo, prev, cur []rgb, vel *vecChain, b blk, root bool) int {
+func treeCost(g geo, prev, cur []rgb, vel *vecChain, b blk, root, color bool) int {
 	if b.split {
 		c := 1
 		for _, k := range b.sub {
-			c += treeCost(g, prev, cur, vel, k, false)
+			c += treeCost(g, prev, cur, vel, k, false, color)
 		}
 		return c
 	}
 	c := estVec(vel, g, b.rect, b.dx, b.dy) + resBits(g, prev, cur, b.rect, b.dx, b.dy)
-	if candidate(g, prev, b.rect, root) {
+	if candidate(g, prev, b.rect, root, color) {
 		c++
 	}
 	return c
@@ -233,8 +289,8 @@ func searchRect(g geo, prev, cur []rgb, r rect) (int, int) {
 	return bestDX, bestDY
 }
 
-func writeTree(w *bits, vel *vecChain, g geo, prev []rgb, b blk, root bool) {
-	if candidate(g, prev, b.rect, root) {
+func writeTree(w *bits, vel *vecChain, g geo, prev []rgb, b blk, root, color bool) {
+	if candidate(g, prev, b.rect, root, color) {
 		if b.split {
 			w.bit(1)
 		} else {
@@ -243,16 +299,16 @@ func writeTree(w *bits, vel *vecChain, g geo, prev []rgb, b blk, root bool) {
 	}
 	if b.split {
 		for _, k := range b.sub {
-			writeTree(w, vel, g, prev, k, false)
+			writeTree(w, vel, g, prev, k, false, color)
 		}
 		return
 	}
 	writeVec(w, vel, g, b.y*g.w+b.x, b.dx, b.dy)
 }
 
-func readTree(r *reader, vel *vecChain, g geo, prev []rgb, rc rect, root bool) (blk, error) {
+func readTree(r *reader, vel *vecChain, g geo, prev []rgb, rc rect, root, color bool) (blk, error) {
 	b := blk{rect: rc}
-	if candidate(g, prev, rc, root) {
+	if candidate(g, prev, rc, root, color) {
 		flag, err := r.bit()
 		if err != nil {
 			return blk{}, err
@@ -262,7 +318,7 @@ func readTree(r *reader, vel *vecChain, g geo, prev []rgb, rc rect, root bool) (
 			b.split = true
 			b.sub = make([]blk, len(parts))
 			for i, p := range parts {
-				k, err := readTree(r, vel, g, prev, p, false)
+				k, err := readTree(r, vel, g, prev, p, false, color)
 				if err != nil {
 					return blk{}, err
 				}

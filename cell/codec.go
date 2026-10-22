@@ -32,7 +32,7 @@ var (
 )
 
 // CompressedSize is the length of the blob for the canonical 32x32 cell.csv.
-const CompressedSize = 23731
+const CompressedSize = 23586
 
 // maxSamples bounds a decoded clip. The full-resolution canonical clip is
 // about 30 million samples; a longer file that would not fit is rejected.
@@ -62,11 +62,12 @@ var bg = rgb{0, 0, 1}
 // 66-frame cycle stays cheap.
 //
 // A block contains one velocity, or smaller blocks, and the smallest block
-// is a pixel. The split flag is written only when the previous frame is
-// both bright and dark inside that rectangle, and a root block also needs
-// the smaller class to cover an eighth of its area. The sample under (x, y)
-// for a leaf velocity (dx, dy) is the previous pixel at (x-dx, y-dy).
-// Off-frame samples are black, which is not the background.
+// is a pixel. A root flag is written when the previous frame is both bright
+// and dark and the smaller class covers an eighth of the block. A block
+// inside that split also opens when it holds two colors and the frame's law
+// is the block warp. The sample under (x, y) for a leaf velocity (dx, dy) is
+// the previous pixel at (x-dx, y-dy). Off-frame samples are black, which is
+// not the background.
 //
 // The residual is the samples that differ from that prediction, a gap into
 // the frame and a zigzag Rice value. The three channels are separate streams
@@ -205,12 +206,11 @@ func Compress(src []byte) ([]byte, error) {
 	laws := newMatChain()
 	vel := newVecChain(g)
 	for t := 1; t < len(pix); t++ {
-		trees := fitFrame(g, pix[t-1], pix[t], vel)
-		law := chooseLaw(g, pix, t, trees, laws)
+		trees, law := fitCoded(g, pix, t, vel, laws)
 		writeLaw(&w, laws, law)
 		if law != matCopy {
 			for _, b := range trees {
-				writeTree(&w, vel, g, pix[t-1], b, true)
+				writeTree(&w, vel, g, pix[t-1], b, true, law == matWarp)
 			}
 			vel.endFrame()
 		}
@@ -254,6 +254,22 @@ func frameResidual(pred, cur []rgb) [channels]plane {
 		}
 	}
 	return mis
+}
+
+// fitCoded selects the tree that will be written. Color splits are tried
+// only when the silhouette tree already chose the block warp, and kept only
+// when that is still the law: mesh laws do not sample the leaves.
+func fitCoded(g geo, pix [][]rgb, t int, vel *vecChain, laws *matChain) ([]blk, int) {
+	trees := fitFrame(g, pix[t-1], pix[t], vel, false)
+	law := chooseLaw(g, pix, t, trees, laws)
+	if law != matWarp {
+		return trees, law
+	}
+	colored := fitFrame(g, pix[t-1], pix[t], vel, true)
+	if chooseLaw(g, pix, t, colored, laws) != matWarp {
+		return trees, law
+	}
+	return colored, matWarp
 }
 
 func chooseLaw(g geo, pix [][]rgb, t int, trees []blk, laws *matChain) int {
@@ -374,8 +390,7 @@ func learnCodec(g geo, pix [][]rgb) (*matChain, *vecChain, [][]blk) {
 	vel := newVecChain(g)
 	fields := make([][]blk, 0, len(pix)-1)
 	for t := 1; t < len(pix); t++ {
-		trees := fitFrame(g, pix[t-1], pix[t], vel)
-		law := chooseLaw(g, pix, t, trees, laws)
+		trees, law := fitCoded(g, pix, t, vel, laws)
 		laws.observe(law)
 		if law == matCopy {
 			continue
@@ -749,7 +764,7 @@ func Decompress(src []byte) ([]byte, error) {
 			parts := tiles(g)
 			trees = make([]blk, len(parts))
 			for i, rc := range parts {
-				b, err := readTree(&r, vel, g, pix[t-1], rc, true)
+				b, err := readTree(&r, vel, g, pix[t-1], rc, true, law == matWarp)
 				if err != nil {
 					return nil, err
 				}
