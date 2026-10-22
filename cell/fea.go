@@ -26,8 +26,8 @@ const (
 	feaDrag = 4.0
 )
 
-// Prediction laws. matWarp is the integer block motion. matSmooth and matHalf
-// move the grid nodes by the averaged block velocity. matSoft and matStiff
+// Prediction laws. matWarp is the integer motion of each triangle. matSmooth
+// and matHalf move the grid nodes by the block velocity. matSoft and matStiff
 // integrate that velocity under plane stress. matCopy repeats the frame one
 // half-clip earlier, which is the cycle in the 66-frame file.
 const (
@@ -221,8 +221,9 @@ func (m *feaMesh) coastLaw(time float64, law feaLaw) {
 
 // advanceForecast applies one of the compressor's laws for one frame.
 // The rest shape is reset to the current shape first, so strain does not
-// accumulate across the forecast. matCopy is not a motion law. A node takes
-// the root block's velocity, which is the mean of that block's leaves.
+// accumulate across the forecast. matCopy is not a motion law. Every node of
+// a cell takes the mean of the block velocities under that cell, so leaves
+// in neighboring blocks do not pull the cell apart.
 func (m *feaMesh) advanceForecast(law int, trees []blk) {
 	for i := range m.nodes {
 		n := &m.nodes[i]
@@ -244,23 +245,36 @@ func (m *feaMesh) advanceForecast(law int, trees []blk) {
 }
 
 func (m *feaMesh) translate(trees []blk, scale float64) {
+	dx, dy := m.cellVel(trees)
 	for i := range m.nodes {
 		n := &m.nodes[i]
-		px, py := nodePixel(m.g, n.x, n.y)
-		dx, dy := blockVel(m.g, trees, px, py)
-		n.x += scale * float64(dx)
-		n.y += scale * float64(dy)
+		n.x += scale * dx
+		n.y += scale * dy
 	}
 }
 
 func (m *feaMesh) setVelocity(trees []blk) {
+	dx, dy := m.cellVel(trees)
 	for i := range m.nodes {
 		n := &m.nodes[i]
-		px, py := nodePixel(m.g, n.x, n.y)
-		dx, dy := blockVel(m.g, trees, px, py)
-		n.vx = float64(dx)
-		n.vy = float64(dy)
+		n.vx = dx
+		n.vy = dy
 	}
+}
+
+func (m *feaMesh) cellVel(trees []blk) (float64, float64) {
+	if len(m.nodes) == 0 {
+		return 0, 0
+	}
+	var sx, sy float64
+	for i := range m.nodes {
+		px, py := nodePixel(m.g, m.nodes[i].x, m.nodes[i].y)
+		dx, dy := blockVel(m.g, trees, px, py)
+		sx += float64(dx)
+		sy += float64(dy)
+	}
+	n := float64(len(m.nodes))
+	return sx / n, sy / n
 }
 
 func nodePixel(g geo, x, y float64) (int, int) {
@@ -433,9 +447,10 @@ func max3(a, b, c float64) float64 {
 }
 
 // predictFrame is the flat-field entry used by tests. Each top-level block
-// is one leaf. predictTrees is the encoder and the decoder: matWarp samples
-// the leaf that contains the pixel, and the mesh laws use the mean velocity
-// of that block's leaves. matCopy reads the frame one half-clip earlier.
+// is one leaf. predictTrees samples that field: matWarp takes the leaf that
+// contains the pixel, and the mesh laws use the mean velocity of that
+// block's leaves. The coded matWarp frame is the triangle partition. matCopy
+// reads the frame one half-clip earlier.
 func predictFrame(g geo, pix [][]rgb, t, mat int, vecs [][2]int) []rgb {
 	return predictTrees(g, pix, t, mat, flatField(g, vecs))
 }

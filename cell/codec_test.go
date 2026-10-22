@@ -267,161 +267,112 @@ func TestGeom(t *testing.T) {
 	}
 }
 
-func TestRecursiveBlocks(t *testing.T) {
-	q := quadrants(rect{0, 0, 2, 2})
-	if len(q) != 4 || q[0] != (rect{0, 0, 1, 1}) || q[1] != (rect{1, 0, 1, 1}) ||
-		q[2] != (rect{0, 1, 1, 1}) || q[3] != (rect{1, 1, 1, 1}) {
-		t.Fatalf("quadrants %v", q)
-	}
-	if got := quadrants(rect{0, 0, 1, 4}); len(got) != 2 || got[0].h != 2 || got[1].y != 2 {
-		t.Fatalf("column split %v", got)
-	}
-	g, err := geom(8, 8)
+func TestTriangles(t *testing.T) {
+	g, err := geom(40, 30)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if g.block != 2 {
-		t.Fatalf("block %d", g.block)
+	rects := append(tiles(g), rect{0, 0, 8, 8}, rect{0, 0, 5, 3}, rect{2, 2, 1, 4}, rect{0, 0, 1, 1})
+	for _, r := range rects {
+		for _, flip := range []bool{false, true} {
+			a, b := blockTris(g, r, flip)
+			if len(a.pix)+len(b.pix) != r.w*r.h {
+				t.Fatalf("cover %+v flip %v %d+%d", r, flip, len(a.pix), len(b.pix))
+			}
+			seen := make([]bool, g.pixels)
+			for _, p := range append(append([]int{}, a.pix...), b.pix...) {
+				if seen[p] {
+					t.Fatalf("dup pixel %d in %+v", p, r)
+				}
+				seen[p] = true
+			}
+		}
 	}
-	prev := make([]rgb, g.pixels)
-	cur := make([]rgb, g.pixels)
-	for i := range prev {
-		prev[i] = bg
-		cur[i] = bg
+
+	g32, err := geom(32, 32)
+	if err != nil {
+		t.Fatal(err)
 	}
-	white := rgb{255, 255, 255}
-	prev[0] = white
-	prev[1] = white
-	cur[1] = white
-	cur[g.w] = white
-	trees := fitFrame(g, prev, cur, newVecChain(g), false)
-	if !trees[0].split || !hasPixel(trees[0]) {
-		t.Fatalf("mixed block did not reach a pixel: %+v", trees[0])
+	still := make([]rgb, g32.pixels)
+	for i := range still {
+		still[i] = bg
 	}
-	if trees[1].split {
-		t.Fatal("uniform block split")
+	quiet := fitTris(g32, still, still, newVecChain(g32))
+	for _, ab := range quiet.pair {
+		if len(ab[0].sub) > 0 || len(ab[1].sub) > 0 {
+			t.Fatal("uniform frame split a triangle")
+		}
 	}
-	pix := [][]rgb{
-		prev, cur,
-		append([]rgb(nil), prev...),
-		append([]rgb(nil), cur...),
+
+	small, err := geom(4, 4)
+	if err != nil {
+		t.Fatal(err)
 	}
-	raw := format(g, rate{30, 1}, pix)
+	pix := make([][]rgb, 4)
+	for f := range pix {
+		row := make([]rgb, small.pixels)
+		for i := range row {
+			row[i] = bg
+		}
+		row[f%small.pixels] = rgb{byte(20 + f), 30, 40}
+		pix[f] = row
+	}
+	raw := format(small, rate{4, 1}, pix)
 	blob, err := Compress(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got, err := Decompress(blob)
 	if err != nil || !bytes.Equal(got, raw) {
-		t.Fatalf("round trip %v", err)
+		t.Fatalf("4x4 round trip %v", err)
 	}
 
 	original, err := os.ReadFile("cell.csv")
 	if err != nil {
 		t.Fatal(err)
 	}
-	cg, _, pix, err := parse(original)
+	cg, _, frames, err := parse(original)
 	if err != nil {
 		t.Fatal(err)
 	}
 	vel := newVecChain(cg)
 	laws := newMatChain()
-	splits, pixels := 0, 0
-	var walk func(blk)
-	walk = func(b blk) {
-		if !b.split {
-			if b.w == 1 && b.h == 1 {
-				pixels++
+	splits, leaves := 0, 0
+	var hist [matN]int
+	var walk func(*tri)
+	walk = func(n *tri) {
+		if len(n.sub) > 0 {
+			splits++
+			for _, k := range n.sub {
+				walk(k)
 			}
 			return
 		}
-		splits++
-		for _, k := range b.sub {
-			walk(k)
+		if len(n.pix) > 0 {
+			leaves++
 		}
 	}
-	for t := 1; t < len(pix); t++ {
-		trees, law := fitCoded(cg, pix, t, vel, laws)
+	for tix := 1; tix < len(frames); tix++ {
+		mot, law := fitCoded(cg, frames, tix, vel, laws)
+		hist[law]++
 		laws.observe(law)
 		if law == matCopy {
 			continue
 		}
-		for _, b := range trees {
-			walk(b)
+		if mot.warp {
+			for _, ab := range mot.tris.pair {
+				walk(ab[0])
+				walk(ab[1])
+			}
 		}
-		for _, b := range trees {
-			noteTree(vel, cg, b)
-		}
+		observeMotion(vel, cg, mot)
 		vel.endFrame()
 	}
-	if splits == 0 || pixels == 0 {
-		t.Fatalf("canonical tree splits %d pixel leaves %d", splits, pixels)
+	if splits == 0 || leaves == 0 {
+		t.Fatalf("canonical triangles splits %d leaves %d", splits, leaves)
 	}
-	t.Logf("canonical tree splits %d pixel leaves %d", splits, pixels)
-}
-
-func TestColorSplit(t *testing.T) {
-	g, err := geom(16, 16)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if g.block != 4 {
-		t.Fatalf("block %d", g.block)
-	}
-	prev := make([]rgb, g.pixels)
-	cur := make([]rgb, g.pixels)
-	for i := range prev {
-		prev[i] = bg
-		cur[i] = bg
-	}
-	red := rgb{255, 0, 0}
-	blue := rgb{0, 0, 255}
-	prev[0], prev[1] = red, red
-	prev[g.w], prev[g.w+1] = blue, blue
-	cur[1], cur[2] = red, red
-	cur[2*g.w], cur[2*g.w+1] = blue, blue
-
-	color := rect{0, 0, 2, 2}
-	if candidate(g, prev, color, true, true) {
-		t.Fatal("root opened on color alone")
-	}
-	if !candidate(g, prev, color, false, true) {
-		t.Fatal("two-color child stayed shut")
-	}
-	if candidate(g, prev, color, false, false) {
-		t.Fatal("mesh frame opened on color")
-	}
-	flat := append([]rgb(nil), prev...)
-	flat[0], flat[1] = rgb{40, 0, 0}, rgb{71, 0, 0}
-	flat[g.w], flat[g.w+1] = rgb{40, 0, 0}, rgb{71, 0, 0}
-	if candidate(g, flat, color, false, true) {
-		t.Fatal("span 31 opened a child")
-	}
-	flat[1], flat[g.w+1] = rgb{72, 0, 0}, rgb{72, 0, 0}
-	if !candidate(g, flat, color, false, true) {
-		t.Fatal("span 32 stayed shut")
-	}
-	if candidate(g, flat, color, true, true) {
-		t.Fatal("root opened on color alone")
-	}
-
-	trees := fitFrame(g, prev, cur, newVecChain(g), true)
-	if !trees[0].split {
-		t.Fatal("silhouette root stayed whole")
-	}
-	if !trees[0].sub[0].split || !hasPixel(trees[0].sub[0]) {
-		t.Fatalf("color child %+v", trees[0].sub[0])
-	}
-	pix := [][]rgb{prev, cur}
-	raw := format(g, rate{30, 1}, pix)
-	blob, err := Compress(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := Decompress(blob)
-	if err != nil || !bytes.Equal(got, raw) {
-		t.Fatalf("round trip %v", err)
-	}
+	t.Logf("triangle splits %d leaves %d laws warp %d smooth %d half %d soft %d stiff %d copy %d",
+		splits, leaves, hist[matWarp], hist[matSmooth], hist[matHalf], hist[matSoft], hist[matStiff], hist[matCopy])
 }
 
 func TestOtherSizes(t *testing.T) {
