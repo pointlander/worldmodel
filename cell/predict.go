@@ -15,24 +15,24 @@ import (
 
 func forecast(args []string) error {
 	if len(args) > 2 {
-		return fmt.Errorf("usage: cell predict [csv] [gif]")
+		return fmt.Errorf("usage: cell predict [file] [gif]")
 	}
-	csvPath := "cell.csv"
-	if _, err := os.Stat(csvPath); err != nil {
-		csvPath = filepath.Join("cell", "cell.csv")
+	path := "cell.bin"
+	if _, err := os.Stat(path); err != nil {
+		path = filepath.Join("cell", "cell.bin")
 	}
 	if len(args) >= 1 {
-		csvPath = args[0]
+		path = args[0]
 	}
-	src, err := os.ReadFile(csvPath)
+	blob, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	blob, err := Compress(src)
+	raw, err := Decompress(blob)
 	if err != nil {
 		return err
 	}
-	g, fps, pix, err := parse(src)
+	g, fps, pix, err := parse(raw)
 	if err != nil {
 		return err
 	}
@@ -40,7 +40,7 @@ func forecast(args []string) error {
 	if err != nil {
 		return err
 	}
-	gifPath := filepath.Join(filepath.Dir(csvPath), gifName(g.w, g.h))
+	gifPath := filepath.Join(filepath.Dir(path), gifName(g.w, g.h))
 	if len(args) >= 2 {
 		gifPath = args[1]
 	}

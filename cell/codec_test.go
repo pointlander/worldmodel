@@ -14,22 +14,25 @@ import (
 )
 
 func TestVideoFlag(t *testing.T) {
-	size, video, rest, err := splitArgs([]string{"-video", "other.mp4", "-size", "full", "out.csv"})
+	size, video, rest, err := splitArgs([]string{"-video", "other.mp4", "-size", "full", "out.bin"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if size != "full" || video != "other.mp4" || len(rest) != 1 || rest[0] != "out.csv" {
+	if size != "full" || video != "other.mp4" || len(rest) != 1 || rest[0] != "out.bin" {
 		t.Fatalf("size %q video %q rest %q", size, video, rest)
 	}
-	got, csv, err := chooseVideo(video, rest)
-	if err != nil || got != "other.mp4" || csv != "out.csv" {
-		t.Fatalf("choose %q %q %v", got, csv, err)
+	got, out, err := chooseVideo(video, rest)
+	if err != nil || got != "other.mp4" || out != "out.bin" {
+		t.Fatalf("choose %q %q %v", got, out, err)
 	}
-	got, csv, err = chooseVideo("", nil)
-	if err != nil || csv != "" || filepath.Base(got) != defaultVideo {
-		t.Fatalf("default %q %q %v", got, csv, err)
+	got, out, err = chooseVideo("", nil)
+	if err != nil || out != "" || filepath.Base(got) != defaultVideo {
+		t.Fatalf("default %q %q %v", got, out, err)
 	}
-	if _, _, err := chooseVideo("", []string{"clip.mp4", "a.csv", "extra"}); err == nil {
+	if binName(32, 32) != "cell.bin" || binName(64, 36) != "cell64x36.bin" {
+		t.Fatalf("names %s %s", binName(32, 32), binName(64, 36))
+	}
+	if _, _, err := chooseVideo("", []string{"clip.mp4", "a.bin", "extra"}); err == nil {
 		t.Fatal("expected usage error")
 	}
 	if _, _, _, err := splitArgs([]string{"-video"}); err == nil {
@@ -189,6 +192,72 @@ func TestShortClip(t *testing.T) {
 		if err != nil || !bytes.Equal(got, raw) {
 			t.Fatalf("n=%d round trip %v", n, err)
 		}
+	}
+}
+
+func TestPredictFile(t *testing.T) {
+	g, err := geom(8, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 4
+	fps := rate{4, 1}
+	pix := make([][]rgb, n)
+	times := make([]string, n)
+	frames := make([][]byte, n)
+	for f := range pix {
+		row := make([]rgb, g.pixels)
+		rawFrame := make([]byte, g.pixels*channels)
+		for i := range row {
+			row[i] = bg
+		}
+		row[0] = rgb{byte(20 + f), 30, 40}
+		for i, p := range row {
+			rawFrame[3*i] = p[0]
+			rawFrame[3*i+1] = p[1]
+			rawFrame[3*i+2] = p[2]
+		}
+		pix[f] = row
+		times[f] = frameTime(f, fps)
+		frames[f] = rawFrame
+	}
+	raw := format(g, fps, pix)
+	encoded, err := encodeCSV(g.w, g.h, times, frames)
+	if err != nil || !bytes.Equal(encoded, raw) {
+		t.Fatalf("encodeCSV %v", err)
+	}
+	blob, err := Compress(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cell.bin")
+	if err := os.WriteFile(path, blob, 0644); err != nil {
+		t.Fatal(err)
+	}
+	gifPath := filepath.Join(dir, "future.gif")
+	if err := forecast([]string{path, gifPath}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(gifPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	decoded, err := gif.DecodeAll(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := n + forecastLen(n)
+	if len(decoded.Image) != want || len(decoded.Delay) != want {
+		t.Fatalf("gif frames %d delays %d", len(decoded.Image), len(decoded.Delay))
+	}
+	scale := displayScale(g)
+	if gifRGB(decoded.Image[0], 0, 0) != pix[0][0] || gifRGB(decoded.Image[0], scale-1, scale-1) != pix[0][0] {
+		t.Fatalf("frame 0 %v", gifRGB(decoded.Image[0], 0, 0))
+	}
+	if err := forecast([]string{"cell.csv", filepath.Join(dir, "bad.gif")}); err == nil {
+		t.Fatal("expected a csv to be rejected")
 	}
 }
 

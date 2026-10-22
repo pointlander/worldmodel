@@ -2,18 +2,19 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Command cell writes one CSV row per video frame.
+// Command cell writes the compressed clip for a video.
 //
 // ffmpeg decodes the video. The default picture is 32x32. -size selects 32,
 // 64, full, or WxH. full keeps the video's own frame size and does not scale.
 // -video selects the file and defaults to DNA cell death and division-L.mp4.
-// Each row is the frame time in seconds followed by the red, green, and blue
-// sample of every pixel in row-major order. The time is the frame index
-// divided by the frame rate reported by the video.
+// The frames are the same CSV the codec compresses: the frame time in
+// seconds, then the red, green, and blue sample of every pixel. The time is
+// the frame index divided by the frame rate reported by the video. The
+// command writes that compressed blob.
 //
-// cell predict writes the original frames, then 33 future frames, as a GIF.
-// A Markov chain draws the next motion field, and each cell's elastic mesh
-// is integrated under that field.
+// cell predict reads the blob and writes the original frames, then 33 future
+// frames, as a GIF. A Markov chain draws the next motion field, and each
+// cell's elastic mesh is integrated under that field.
 package main
 
 import (
@@ -30,7 +31,7 @@ import (
 )
 
 const (
-	usageText    = "usage: cell [-size 32|64|full|WxH] [-video FILE] [csv]\n       cell predict [csv] [gif]"
+	usageText    = "usage: cell [-size 32|64|full|WxH] [-video FILE] [file]\n       cell predict [file] [gif]"
 	defaultVideo = "DNA cell death and division-L.mp4"
 )
 
@@ -49,7 +50,7 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	video, csvArg, err := chooseVideo(videoFlag, rest)
+	video, outArg, err := chooseVideo(videoFlag, rest)
 	if err != nil {
 		return err
 	}
@@ -60,9 +61,9 @@ func run(args []string) error {
 	if _, err := geom(w, h); err != nil {
 		return fmt.Errorf("size %dx%d is too large to code", w, h)
 	}
-	csvPath := filepath.Join(filepath.Dir(video), csvName(w, h))
-	if csvArg != "" {
-		csvPath = csvArg
+	outPath := filepath.Join(filepath.Dir(video), binName(w, h))
+	if outArg != "" {
+		outPath = outArg
 	}
 	fps, err := probeRate(video)
 	if err != nil {
@@ -76,10 +77,18 @@ func run(args []string) error {
 	for i := range times {
 		times[i] = frameTime(i, fps)
 	}
-	if err := writeCSV(csvPath, w, h, times, frames); err != nil {
+	raw, err := encodeCSV(w, h, times, frames)
+	if err != nil {
 		return err
 	}
-	fmt.Printf("wrote %d frames of %dx%d at %d/%d fps to %s\n", len(frames), w, h, fps.num, fps.den, csvPath)
+	blob, err := Compress(raw)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(outPath, blob, 0644); err != nil {
+		return err
+	}
+	fmt.Printf("wrote %d frames of %dx%d at %d/%d fps to %s (%d bytes)\n", len(frames), w, h, fps.num, fps.den, outPath, len(blob))
 	return nil
 }
 
@@ -108,16 +117,16 @@ func splitArgs(args []string) (size, video string, rest []string, err error) {
 
 // chooseVideo resolves the input file. -video names it. Otherwise a
 // positional path is the file, and with no path the default clip is used.
-// One positional beside -video is the CSV path.
-func chooseVideo(videoFlag string, rest []string) (video, csvArg string, err error) {
+// One positional beside -video is the output path.
+func chooseVideo(videoFlag string, rest []string) (video, outArg string, err error) {
 	if videoFlag != "" {
 		if len(rest) > 1 {
 			return "", "", errors.New(usageText)
 		}
 		if len(rest) == 1 {
-			csvArg = rest[0]
+			outArg = rest[0]
 		}
-		return videoFlag, csvArg, nil
+		return videoFlag, outArg, nil
 	}
 	switch len(rest) {
 	case 0:
@@ -192,11 +201,11 @@ func probeVideo(video string) (int, int, error) {
 	return w, h, nil
 }
 
-func csvName(w, h int) string {
+func binName(w, h int) string {
 	if w == 32 && h == 32 {
-		return "cell.csv"
+		return "cell.bin"
 	}
-	return fmt.Sprintf("cell%dx%d.csv", w, h)
+	return fmt.Sprintf("cell%dx%d.bin", w, h)
 }
 
 func probeRate(video string) (rate, error) {
@@ -300,11 +309,16 @@ func framesOf(video string, w, h int, native bool) (frames [][]byte, err error) 
 }
 
 func writeCSV(path string, w, h int, times []string, frames [][]byte) error {
-	f, err := os.Create(path)
+	b, err := encodeCSV(w, h, times, frames)
 	if err != nil {
 		return err
 	}
-	out := csv.NewWriter(f)
+	return os.WriteFile(path, b, 0644)
+}
+
+func encodeCSV(w, h int, times []string, frames [][]byte) ([]byte, error) {
+	var buf bytes.Buffer
+	out := csv.NewWriter(&buf)
 	header := make([]string, 1+w*h*channels)
 	header[0] = "time"
 	i := 1
@@ -317,7 +331,7 @@ func writeCSV(path string, w, h int, times []string, frames [][]byte) error {
 		}
 	}
 	if err := out.Write(header); err != nil {
-		return err
+		return nil, err
 	}
 	row := make([]string, len(header))
 	for i, pixels := range frames {
@@ -326,12 +340,12 @@ func writeCSV(path string, w, h int, times []string, frames [][]byte) error {
 			row[j+1] = strconv.Itoa(int(p))
 		}
 		if err := out.Write(row); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	out.Flush()
 	if err := out.Error(); err != nil {
-		return err
+		return nil, err
 	}
-	return f.Close()
+	return buf.Bytes(), nil
 }
