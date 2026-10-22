@@ -1364,19 +1364,6 @@ func gcd64(a, b int64) int64 {
 	return a
 }
 
-// centiseconds is the GIF delay for one frame at this rate, rounded to
-// the nearest centisecond and at least 1. 4/1 is 25.
-func centiseconds(fps rate) int {
-	if fps.num <= 0 || fps.den <= 0 {
-		return 1
-	}
-	cs := (200*int64(fps.den) + int64(fps.num)) / (2 * int64(fps.num))
-	if cs < 1 {
-		return 1
-	}
-	return int(cs)
-}
-
 // bits is a most-significant-bit-first stream. Rice codes write a unary
 // quotient of one-bits ended by a zero, then the low k bits.
 type bits struct {

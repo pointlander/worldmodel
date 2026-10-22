@@ -13,7 +13,7 @@
 // command writes that compressed blob.
 //
 // cell predict reads the blob and writes the original frames, then 33 future
-// frames, as a GIF. A Markov chain draws the next motion field, and each
+// frames, as a WebM. A Markov chain draws the next motion field, and each
 // cell's elastic mesh is integrated under that field.
 package main
 
@@ -31,7 +31,7 @@ import (
 )
 
 const (
-	usageText    = "usage: cell [-size 32|64|full|WxH] [-video FILE] [file]\n       cell predict [file] [gif]"
+	usageText    = "usage: cell [-size 32|64|full|WxH] [-video FILE] [file]\n       cell predict [file] [webm]"
 	defaultVideo = "DNA cell death and division-L.mp4"
 )
 

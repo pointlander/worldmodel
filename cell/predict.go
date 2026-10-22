@@ -5,17 +5,17 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
-	"image"
-	"image/color"
-	"image/gif"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 )
 
 func forecast(args []string) error {
 	if len(args) > 2 {
-		return fmt.Errorf("usage: cell predict [file] [gif]")
+		return fmt.Errorf("usage: cell predict [file] [webm]")
 	}
 	path := "cell.bin"
 	if _, err := os.Stat(path); err != nil {
@@ -40,17 +40,17 @@ func forecast(args []string) error {
 	if err != nil {
 		return err
 	}
-	gifPath := filepath.Join(filepath.Dir(path), gifName(g.w, g.h))
+	webmPath := filepath.Join(filepath.Dir(path), videoName(g.w, g.h))
 	if len(args) >= 2 {
-		gifPath = args[1]
+		webmPath = args[1]
 	}
 	clip := make([][]rgb, 0, len(pix)+len(future))
 	clip = append(clip, pix...)
 	clip = append(clip, future...)
-	if err := writeGIF(gifPath, g, clip, centiseconds(fps)); err != nil {
+	if err := writeWebM(webmPath, g, clip, fps); err != nil {
 		return err
 	}
-	fmt.Printf("wrote %d source frames and %d predicted frames to %s\n", len(pix), len(future), gifPath)
+	fmt.Printf("wrote %d source frames and %d predicted frames to %s\n", len(pix), len(future), webmPath)
 	return nil
 }
 
@@ -66,103 +66,79 @@ func forecastLen(n int) int {
 	return n / 2
 }
 
-func gifName(w, h int) string {
+func videoName(w, h int) string {
 	if w == 32 && h == 32 {
-		return "future.gif"
+		return "future.webm"
 	}
-	return fmt.Sprintf("future%dx%d.gif", w, h)
+	return fmt.Sprintf("future%dx%d.webm", w, h)
 }
 
-// displayScale keeps the long side near 256 pixels. A 32x32 frame stays at
-// 8, which is the canonical GIF. Full resolution is drawn 1:1.
-func displayScale(g geo) int {
-	side := g.w
-	if g.h > side {
-		side = g.h
-	}
-	s := 256 / side
-	if s < 1 {
-		s = 1
-	}
-	return s
-}
-
-func writeGIF(path string, g geo, clip [][]rgb, delay int) error {
-	scale := displayScale(g)
-	img := &gif.GIF{LoopCount: 0}
-	for f := range clip {
-		frame, err := palettedFrame(g, scale, clip[f])
-		if err != nil {
-			return err
-		}
-		if f == 0 {
-			img.Config = image.Config{
-				ColorModel: frame.Palette,
-				Width:      g.w * scale,
-				Height:     g.h * scale,
-			}
-		}
-		img.Image = append(img.Image, frame)
-		img.Delay = append(img.Delay, delay)
-	}
-	out, err := os.Create(path)
+// writeWebM pipes the rgb24 frames to ffmpeg. Lossless VP9 in gbrp stores
+// those samples, so decoding the file restores them.
+func writeWebM(path string, g geo, clip [][]rgb, fps rate) error {
+	cmd := exec.Command("ffmpeg",
+		"-hide_banner",
+		"-nostats",
+		"-y",
+		"-f", "rawvideo",
+		"-pix_fmt", "rgb24",
+		"-s", fmt.Sprintf("%dx%d", g.w, g.h),
+		"-r", fmt.Sprintf("%d/%d", fps.num, fps.den),
+		"-i", "pipe:0",
+		"-an",
+		"-c:v", "libvpx-vp9",
+		"-lossless", "1",
+		"-pix_fmt", "gbrp",
+		"-f", "webm",
+		path,
+	)
+	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
 	}
-	if err := gif.EncodeAll(out, img); err != nil {
-		out.Close()
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
 		return err
 	}
-	return out.Close()
-}
-
-// palettedFrame builds a local palette. Frames with more than 256 colors,
-// which a 32x32 frame of this clip does not have, are reduced to 3-3-2.
-func palettedFrame(g geo, scale int, frame []rgb) (*image.Paletted, error) {
-	src := frame
-	if tooManyColors(frame) {
-		q := make([]rgb, len(frame))
-		for i, c := range frame {
-			q[i] = rgb{c[0] & 0xe0, c[1] & 0xe0, c[2] & 0xc0}
-		}
-		src = q
+	if err := cmd.Start(); err != nil {
+		return err
 	}
-	index := make(map[rgb]uint8, 256)
-	pal := make(color.Palette, 0, 256)
-	for _, c := range src {
-		if _, ok := index[c]; ok {
-			continue
+	var log bytes.Buffer
+	logErr := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(&log, stderr)
+		logErr <- err
+	}()
+	buf := make([]byte, g.pixels*channels)
+	var writeErr error
+	for _, frame := range clip {
+		if len(frame) != g.pixels {
+			writeErr = fmt.Errorf("frame has %d pixels", len(frame))
+			break
 		}
-		if len(pal) == 256 {
-			return nil, fmt.Errorf("cell: frame has more than 256 colors")
+		for i, p := range frame {
+			buf[3*i] = p[0]
+			buf[3*i+1] = p[1]
+			buf[3*i+2] = p[2]
 		}
-		index[c] = uint8(len(pal))
-		pal = append(pal, color.RGBA{R: c[0], G: c[1], B: c[2], A: 255})
-	}
-	img := image.NewPaletted(image.Rect(0, 0, g.w*scale, g.h*scale), pal)
-	for y := 0; y < g.h; y++ {
-		for x := 0; x < g.w; x++ {
-			c := index[src[y*g.w+x]]
-			for dy := 0; dy < scale; dy++ {
-				for dx := 0; dx < scale; dx++ {
-					img.SetColorIndex(x*scale+dx, y*scale+dy, c)
-				}
-			}
+		if _, err := stdin.Write(buf); err != nil {
+			writeErr = err
+			break
 		}
 	}
-	return img, nil
-}
-
-func tooManyColors(frame []rgb) bool {
-	seen := make(map[rgb]struct{}, 257)
-	for _, c := range frame {
-		if _, ok := seen[c]; ok {
-			continue
-		}
-		if len(seen) == 256 {
-			return true
-		}
-		seen[c] = struct{}{}
+	if err := stdin.Close(); err != nil && writeErr == nil {
+		writeErr = err
 	}
-	return false
+	if err := <-logErr; err != nil && writeErr == nil {
+		writeErr = err
+	}
+	waitErr := cmd.Wait()
+	if waitErr != nil {
+		msg := log.String()
+		if len(msg) > 2000 {
+			msg = msg[len(msg)-2000:]
+		}
+		return fmt.Errorf("ffmpeg: %w\n%s", waitErr, msg)
+	}
+	return writeErr
 }

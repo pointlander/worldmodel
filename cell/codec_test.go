@@ -6,8 +6,6 @@ package main
 
 import (
 	"bytes"
-	"image"
-	"image/gif"
 	"os"
 	"path/filepath"
 	"testing"
@@ -57,9 +55,6 @@ func TestFrameRate(t *testing.T) {
 	if frameTime(0, fps4) != "0" || frameTime(1, fps4) != "0.25" || frameTime(2, fps4) != "0.5" ||
 		frameTime(3, fps4) != "0.75" || frameTime(5, fps4) != "1.25" || frameTime(65, fps4) != "16.25" {
 		t.Fatalf("4/1 times %q %q %q", frameTime(1, fps4), frameTime(2, fps4), frameTime(65, fps4))
-	}
-	if centiseconds(fps4) != 25 {
-		t.Fatalf("delay %d", centiseconds(fps4))
 	}
 	video, err := defaultVideoPath()
 	if err != nil {
@@ -235,28 +230,34 @@ func TestPredictFile(t *testing.T) {
 	if err := os.WriteFile(path, blob, 0644); err != nil {
 		t.Fatal(err)
 	}
-	gifPath := filepath.Join(dir, "future.gif")
-	if err := forecast([]string{path, gifPath}); err != nil {
+	webmPath := filepath.Join(dir, "future.webm")
+	if err := forecast([]string{path, webmPath}); err != nil {
 		t.Fatal(err)
 	}
-	f, err := os.Open(gifPath)
+	future, err := Predict(blob)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
-	decoded, err := gif.DecodeAll(f)
+	decoded, err := framesOf(webmPath, g.w, g.h, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := n + forecastLen(n)
-	if len(decoded.Image) != want || len(decoded.Delay) != want {
-		t.Fatalf("gif frames %d delays %d", len(decoded.Image), len(decoded.Delay))
+	want := make([][]rgb, 0, n+len(future))
+	want = append(want, pix...)
+	want = append(want, future...)
+	if len(decoded) != len(want) {
+		t.Fatalf("webm frames %d", len(decoded))
 	}
-	scale := displayScale(g)
-	if gifRGB(decoded.Image[0], 0, 0) != pix[0][0] || gifRGB(decoded.Image[0], scale-1, scale-1) != pix[0][0] {
-		t.Fatalf("frame 0 %v", gifRGB(decoded.Image[0], 0, 0))
+	for i := range want {
+		if !bytes.Equal(decoded[i], frameBytes(want[i])) {
+			t.Fatalf("frame %d", i)
+		}
 	}
-	if err := forecast([]string{"cell.csv", filepath.Join(dir, "bad.gif")}); err == nil {
+	got, err := probeRate(webmPath)
+	if err != nil || got != fps {
+		t.Fatalf("rate %d/%d %v", got.num, got.den, err)
+	}
+	if err := forecast([]string{"cell.csv", filepath.Join(dir, "bad.webm")}); err == nil {
 		t.Fatal("expected a csv to be rejected")
 	}
 }
@@ -312,7 +313,7 @@ func TestVideo01(t *testing.T) {
 }
 
 func TestGeom(t *testing.T) {
-	check := func(w, h, block, mv, gx, gy, stride, bits, cellMin, scale int) {
+	check := func(w, h, block, mv, gx, gy, stride, bits, cellMin int) {
 		t.Helper()
 		g, err := geom(w, h)
 		if err != nil {
@@ -320,14 +321,14 @@ func TestGeom(t *testing.T) {
 		}
 		if g.block != block || g.mvRange != mv || g.gridX != gx || g.gridY != gy ||
 			g.stride != stride || g.countBits != bits || g.cellMin != cellMin ||
-			g.nBlock != gx*gy || displayScale(g) != scale {
-			t.Fatalf("%dx%d geo %+v scale %d", w, h, g, displayScale(g))
+			g.nBlock != gx*gy {
+			t.Fatalf("%dx%d geo %+v", w, h, g)
 		}
 	}
-	check(32, 32, 8, 2, 4, 4, 1, 16, 8, 8)
-	check(64, 64, 16, 4, 4, 4, 1, 32, 32, 4)
-	check(16, 16, 4, 1, 4, 4, 1, 16, 8, 16)
-	check(762, 590, 128, 8, 6, 5, 16, 32, 3512, 1)
+	check(32, 32, 8, 2, 4, 4, 1, 16, 8)
+	check(64, 64, 16, 4, 4, 4, 1, 32, 32)
+	check(16, 16, 4, 1, 4, 4, 1, 16, 8)
+	check(762, 590, 128, 8, 6, 5, 16, 32, 3512)
 	if _, err := geom(0, 32); err != ErrFormat {
 		t.Fatalf("zero width: %v", err)
 	}
@@ -630,87 +631,25 @@ func TestPredict(t *testing.T) {
 	clip := make([][]rgb, 0, frames+half)
 	clip = append(clip, pix...)
 	clip = append(clip, future...)
-	path := filepath.Join(t.TempDir(), "future.gif")
-	if err := writeGIF(path, g, clip, centiseconds(fps)); err != nil {
+	path := filepath.Join(t.TempDir(), "future.webm")
+	if err := writeWebM(path, g, clip, fps); err != nil {
 		t.Fatal(err)
 	}
-	f, err := os.Open(path)
+	decoded, err := framesOf(path, g.w, g.h, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
-	decoded, err := gif.DecodeAll(f)
-	if err != nil {
-		t.Fatal(err)
+	if len(decoded) != len(clip) {
+		t.Fatalf("webm frames %d", len(decoded))
 	}
-	if len(decoded.Image) != frames+half || len(decoded.Delay) != frames+half {
-		t.Fatalf("gif frames %d delays %d", len(decoded.Image), len(decoded.Delay))
-	}
-	scale := displayScale(g)
-	if decoded.Image[0].Bounds().Dx() != g.w*scale || decoded.Image[0].Bounds().Dy() != g.h*scale {
-		t.Fatalf("gif size %v", decoded.Image[0].Bounds())
-	}
-	check := func(frame, x, y int, want rgb) {
-		t.Helper()
-		if got := gifRGB(decoded.Image[frame], x*scale, y*scale); got != want {
-			t.Fatalf("frame %d pixel %d,%d = %v, want %v", frame, x, y, got, want)
-		}
-		if got := gifRGB(decoded.Image[frame], x*scale+scale-1, y*scale+scale-1); got != want {
-			t.Fatalf("frame %d pixel %d,%d scale edge = %v, want %v", frame, x, y, got, want)
+	for i := range clip {
+		if !bytes.Equal(decoded[i], frameBytes(clip[i])) {
+			t.Fatalf("frame %d", i)
 		}
 	}
-	check(0, 0, 0, pix[0][0])
-	check(frames-1, 4, 4, pix[frames-1][4*g.w+4])
-	check(frames, 4, 4, future[0][4*g.w+4])
-	for _, d := range decoded.Delay {
-		if d != centiseconds(fps) || d != 25 {
-			t.Fatalf("delay %d", d)
-		}
-	}
-}
-
-func TestPalette(t *testing.T) {
-	g, err := geom(32, 32)
-	if err != nil {
-		t.Fatal(err)
-	}
-	exact := make([]rgb, g.pixels)
-	for i := range exact {
-		exact[i] = bg
-	}
-	exact[g.w+1] = rgb{9, 8, 7}
-	busy := make([]rgb, g.pixels)
-	for y := 0; y < g.h; y++ {
-		for x := 0; x < g.w; x++ {
-			busy[y*g.w+x] = rgb{byte(x), byte(y), byte(x*3 + y*5)}
-		}
-	}
-	if !tooManyColors(busy) {
-		t.Fatal("expected more than 256 colors")
-	}
-	path := filepath.Join(t.TempDir(), "pal.gif")
-	if err := writeGIF(path, g, [][]rgb{exact, busy}, centiseconds(rate{4, 1})); err != nil {
-		t.Fatal(err)
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	decoded, err := gif.DecodeAll(f)
-	if err != nil {
-		t.Fatal(err)
-	}
-	scale := displayScale(g)
-	if gifRGB(decoded.Image[0], scale, scale) != (rgb{9, 8, 7}) {
-		t.Fatalf("exact color %v", gifRGB(decoded.Image[0], scale, scale))
-	}
-	// (1,1) is rgb{1,1,8}. 3-3-2 sends it to black, and the palette stays legal.
-	if gifRGB(decoded.Image[1], scale, scale) != (rgb{}) {
-		t.Fatalf("quantized color %v", gifRGB(decoded.Image[1], scale, scale))
-	}
-	if len(decoded.Image[1].Palette) > 256 {
-		t.Fatalf("palette %d", len(decoded.Image[1].Palette))
+	got, err := probeRate(path)
+	if err != nil || got != fps {
+		t.Fatalf("rate %d/%d %v", got.num, got.den, err)
 	}
 }
 
@@ -738,9 +677,14 @@ func samePic(a, b []rgb) bool {
 	return true
 }
 
-func gifRGB(img image.Image, x, y int) rgb {
-	r, g, b, _ := img.At(x, y).RGBA()
-	return rgb{byte(r >> 8), byte(g >> 8), byte(b >> 8)}
+func frameBytes(frame []rgb) []byte {
+	raw := make([]byte, len(frame)*channels)
+	for i, p := range frame {
+		raw[3*i] = p[0]
+		raw[3*i+1] = p[1]
+		raw[3*i+2] = p[2]
+	}
+	return raw
 }
 
 func TestRejects(t *testing.T) {
