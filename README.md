@@ -25,7 +25,7 @@ usage: cell [-size 32|64|full|WxH] [-video FILE] [file]
 
 The default picture is 32×32. `-size full` keeps the video's own frame size. `-video` defaults to `DNA cell death and division-L.mp4` in the working directory or in `cell/`. A 32×32 conversion is named `cell.bin`; any other size is named `cell{w}x{h}.bin`, next to the video unless an output path is given. The tracked `cell/cell.csv` is the canonical table the tests compress.
 
-`predict` reads that blob, appends 33 forecast frames, and writes a WebM. The frames go to ffmpeg as rgb24 and are stored with lossless VP9. A Markov chain draws the next law and motion, and each cell's elastic mesh advances under that draw.
+`predict` reads that blob, appends 8 seconds of forecast frames at the clip's frame rate, and writes a WebM. The frames go to ffmpeg as rgb24 and are stored with lossless VP9. A Markov chain draws the next law and motion, and each cell's elastic mesh advances under that draw.
 
 The compressor predicts each frame after the first. A block warp cuts every block into two triangles and may split a triangle at the midpoints of its edges. A mesh law moves the grid by one velocity per block. In the second half of an even-length clip, a frame may repeat its paired earlier frame. The canonical 32×32 clip compresses to 22995 bytes.
 

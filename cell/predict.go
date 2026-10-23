@@ -54,16 +54,19 @@ func forecast(args []string) error {
 	return nil
 }
 
-// forecastLen is the number of frames Predict draws. A clip at least as long
-// as the canonical file draws 33 frames; a shorter clip draws half of itself.
-func forecastLen(n int) int {
-	if n >= frames {
-		return half
-	}
-	if n < 2 {
+const forecastSeconds = 8
+
+// forecastLen is the number of frames that span forecastSeconds at this
+// rate, rounded to the nearest frame and at least one.
+func forecastLen(fps rate) int {
+	if fps.num <= 0 || fps.den <= 0 {
 		return 1
 	}
-	return n / 2
+	n := (int64(forecastSeconds)*int64(fps.num) + int64(fps.den)/2) / int64(fps.den)
+	if n < 1 {
+		return 1
+	}
+	return int(n)
 }
 
 func videoName(w, h int) string {

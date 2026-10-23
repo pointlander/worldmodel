@@ -92,6 +92,11 @@ func TestFrameRate(t *testing.T) {
 			t.Fatalf("stored %d/%d, want %d/%d", num, den, fps.num, fps.den)
 		}
 	}
+	if forecastLen(rate{4, 1}) != 32 || forecastLen(rate{30, 1}) != 240 ||
+		forecastLen(rate{24, 1}) != 192 || forecastLen(rate{30000, 1001}) != 240 ||
+		forecastLen(rate{1, 10}) != 1 {
+		t.Fatalf("forecast lengths %d %d %d %d", forecastLen(rate{4, 1}), forecastLen(rate{30, 1}), forecastLen(rate{24, 1}), forecastLen(rate{30000, 1001}))
+	}
 	if frameTime(1, rate{24, 1}) != "1/24" || frameTime(1, rate{10, 1}) != "0.1" {
 		t.Fatalf("times %s %s", frameTime(1, rate{24, 1}), frameTime(1, rate{10, 1}))
 	}
@@ -605,8 +610,12 @@ func TestPredict(t *testing.T) {
 	if !moved {
 		t.Fatal("forecast did not move")
 	}
+	if len(future) != forecastLen(fps) {
+		t.Fatalf("forecast frames %d", len(future))
+	}
+	last := future[len(future)-1]
 	bright, srcBright := 0, 0
-	for _, v := range future[half-1] {
+	for _, v := range last {
 		if luma(v) > 1 {
 			bright++
 		}
@@ -620,7 +629,7 @@ func TestPredict(t *testing.T) {
 		t.Fatalf("cells faded: %d bright pixels, source had %d", bright, srcBright)
 	}
 	kept := 0
-	for _, c := range components(g, future[half-1]) {
+	for _, c := range components(g, last) {
 		if len(c.pix) >= g.cellMin {
 			kept++
 		}
@@ -628,7 +637,7 @@ func TestPredict(t *testing.T) {
 	if kept < 3 {
 		t.Fatalf("cells lost: %d remain", kept)
 	}
-	clip := make([][]rgb, 0, frames+half)
+	clip := make([][]rgb, 0, len(pix)+len(future))
 	clip = append(clip, pix...)
 	clip = append(clip, future...)
 	path := filepath.Join(t.TempDir(), "future.webm")

@@ -12,9 +12,9 @@
 // the frame index divided by the frame rate reported by the video. The
 // command writes that compressed blob.
 //
-// cell predict reads the blob and writes the original frames, then 33 future
-// frames, as a WebM. A Markov chain draws the next motion field, and each
-// cell's elastic mesh is integrated under that field.
+// cell predict reads the blob and writes the original frames, then 8 seconds
+// of future frames, as a WebM. A Markov chain draws the next motion field,
+// and each cell's elastic mesh is integrated under that field.
 package main
 
 import (

@@ -428,7 +428,7 @@ func Predict(blob []byte) ([][]rgb, error) {
 	if err != nil {
 		return nil, err
 	}
-	g, _, pix, err := parse(raw)
+	g, fps, pix, err := parse(raw)
 	if err != nil {
 		return nil, err
 	}
@@ -441,7 +441,7 @@ func Predict(blob []byte) ([][]rgb, error) {
 	}
 	rng := lcg(1)
 	tops := tiles(g)
-	out := make([][]rgb, forecastLen(len(pix)))
+	out := make([][]rgb, forecastLen(fps))
 	for f := range out {
 		law := drawLaw(&rng, laws)
 		prop := make([][2]int, len(tops))
