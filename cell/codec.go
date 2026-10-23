@@ -32,7 +32,7 @@ var (
 )
 
 // CompressedSize is the length of the blob for the canonical 32x32 cell.csv.
-const CompressedSize = 22995
+const CompressedSize = 22985
 
 // maxSamples bounds a decoded clip. The full-resolution canonical clip is
 // about 30 million samples; a longer file that would not fit is rejected.
@@ -53,9 +53,10 @@ var bg = rgb{0, 0, 1}
 // uint16 and 32 bits otherwise.
 //
 // Frame 0 stores the samples that differ from the background. Each later
-// frame is predicted by a finite-element law. A Markov chain, learned from
-// the laws and the block velocities already coded, proposes the next law and
-// the next velocity of each block. The blob stores only the miss: one bit
+// frame is predicted by a finite-element law. A second-order Markov chain,
+// learned from the laws and the block velocities already coded, proposes the
+// next law and the next velocity of each block. An empty pair falls back to
+// the first-order row. The blob stores only the miss: one bit
 // when the proposal is right, otherwise the law id or the velocity. The laws
 // are the shared table in fea.go. matCopy, legal in the second half of an
 // even-length clip, repeats the paired earlier frame; that is how the
@@ -492,19 +493,12 @@ func nearestMotion(fields []motion, prop [][2]int) motion {
 }
 
 func drawLaw(r *lcg, m *matChain) int {
-	row := m.marg
-	if m.seen {
-		row = m.trans[m.prev]
-	}
+	row := m.context(true)
 	return draw(r, without(row, matCopy), without(m.marg, matCopy), matWarp)
 }
 
 func drawVec(r *lcg, v *vecChain, b int) int {
-	row := v.marg
-	if v.seen {
-		row = v.trans[v.prev[b]]
-	}
-	return draw(r, row, v.marg, v.zero)
+	return draw(r, v.context(b), v.marg, v.zero)
 }
 
 func without(row []int, ban int) []int {
@@ -526,31 +520,46 @@ func idVector(g geo, id int) (int, int) {
 	return id%span - g.mvRange, id/span - g.mvRange
 }
 
-// matChain is the first-order model of the finite-element law. The proposal
-// is the mode of the transitions out of the previous law, or the marginal
-// when that row is empty. Ties keep the smaller id.
+// matChain is the second-order model of the finite-element law. The proposal
+// is the mode of the pair of previous laws. An empty pair uses the previous
+// law alone, then the marginal. Ties keep the smaller id.
 type matChain struct {
+	pair  [][][]int
 	trans [][]int
 	marg  []int
+	prev2 int
 	prev  int
-	seen  bool
+	depth int
 }
 
 func newMatChain() *matChain {
-	m := &matChain{trans: make([][]int, matN), marg: make([]int, matN)}
-	for i := range m.trans {
+	m := &matChain{
+		pair:  make([][][]int, matN),
+		trans: make([][]int, matN),
+		marg:  make([]int, matN),
+	}
+	for i := range m.pair {
+		m.pair[i] = make([][]int, matN)
 		m.trans[i] = make([]int, matN)
+		for j := range m.pair[i] {
+			m.pair[i][j] = make([]int, matN)
+		}
 	}
 	return m
 }
 
-func (m *matChain) proposal() int {
-	if m.seen {
-		if id, ok := modeOf(m.trans[m.prev]); ok {
-			return id
-		}
+func (m *matChain) context(banCopy bool) []int {
+	if m.depth >= 2 && usable(m.pair[m.prev2][m.prev], banCopy) {
+		return m.pair[m.prev2][m.prev]
 	}
-	if id, ok := modeOf(m.marg); ok {
+	if m.depth >= 1 && usable(m.trans[m.prev], banCopy) {
+		return m.trans[m.prev]
+	}
+	return m.marg
+}
+
+func (m *matChain) proposal() int {
+	if id, ok := modeOf(m.context(false)); ok {
 		return id
 	}
 	return matWarp
@@ -558,37 +567,56 @@ func (m *matChain) proposal() int {
 
 func (m *matChain) observe(id int) {
 	m.marg[id]++
-	if m.seen {
+	if m.depth >= 2 {
+		m.pair[m.prev2][m.prev][id]++
+	}
+	if m.depth >= 1 {
 		m.trans[m.prev][id]++
+		m.prev2 = m.prev
 	}
 	m.prev = id
-	m.seen = true
+	if m.depth < 2 {
+		m.depth++
+	}
 }
 
 // follow moves the chain's state without counting the forecast as training.
 func (m *matChain) follow(id int) {
+	if m.depth >= 1 {
+		m.prev2 = m.prev
+	}
 	m.prev = id
-	m.seen = true
+	if m.depth < 2 {
+		m.depth++
+	}
 }
 
 // vecChain is the same model on block velocities. A leaf keeps its state at
 // the pixel where that leaf starts, so a block and the pixels inside it do
-// not share a slot. The first motion frame fills the marginal only; seen
-// flips after that frame, not after a fixed number of leaves.
+// not share a slot. The pair table is flat. mvRange is at most 8, so the
+// alphabet has at most 17² symbols. The first motion frame fills the
+// marginal only, and the second fills the first-order rows. frames advances
+// at the end of a motion frame, not after each leaf.
 type vecChain struct {
-	trans [][]int
-	marg  []int
-	prev  []int
-	zero  int
-	seen  bool
+	pair   []int
+	trans  [][]int
+	marg   []int
+	prev2  []int
+	prev   []int
+	n      int
+	zero   int
+	frames int
 }
 
 func newVecChain(g geo) *vecChain {
 	n := nVec(g)
 	v := &vecChain{
+		pair:  make([]int, n*n*n),
 		trans: make([][]int, n),
 		marg:  make([]int, n),
+		prev2: make([]int, g.pixels),
 		prev:  make([]int, g.pixels),
+		n:     n,
 		zero:  vectorID(g, 0, 0),
 	}
 	for i := range v.trans {
@@ -596,17 +624,29 @@ func newVecChain(g geo) *vecChain {
 	}
 	for i := range v.prev {
 		v.prev[i] = v.zero
+		v.prev2[i] = v.zero
 	}
 	return v
 }
 
-func (v *vecChain) proposal(origin int) int {
-	if v.seen {
-		if id, ok := modeOf(v.trans[v.prev[origin]]); ok {
-			return id
-		}
+func (v *vecChain) pairRow(a, b int) []int {
+	n := v.n
+	i := (a*n + b) * n
+	return v.pair[i : i+n]
+}
+
+func (v *vecChain) context(origin int) []int {
+	if v.frames >= 2 && usable(v.pairRow(v.prev2[origin], v.prev[origin]), false) {
+		return v.pairRow(v.prev2[origin], v.prev[origin])
 	}
-	if id, ok := modeOf(v.marg); ok {
+	if v.frames >= 1 && usable(v.trans[v.prev[origin]], false) {
+		return v.trans[v.prev[origin]]
+	}
+	return v.marg
+}
+
+func (v *vecChain) proposal(origin int) int {
+	if id, ok := modeOf(v.context(origin)); ok {
 		return id
 	}
 	return v.zero
@@ -614,18 +654,37 @@ func (v *vecChain) proposal(origin int) int {
 
 func (v *vecChain) observe(origin, id int) {
 	v.marg[id]++
-	if v.seen {
+	if v.frames >= 2 {
+		v.pairRow(v.prev2[origin], v.prev[origin])[id]++
+	}
+	if v.frames >= 1 {
 		v.trans[v.prev[origin]][id]++
+		v.prev2[origin] = v.prev[origin]
 	}
 	v.prev[origin] = id
 }
 
 func (v *vecChain) endFrame() {
-	v.seen = true
+	if v.frames < 2 {
+		v.frames++
+	}
 }
 
 func (v *vecChain) follow(origin, id int) {
+	if v.frames >= 1 {
+		v.prev2[origin] = v.prev[origin]
+	}
 	v.prev[origin] = id
+}
+
+func usable(row []int, banCopy bool) bool {
+	for i, c := range row {
+		if c == 0 || (banCopy && i == matCopy) {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func modeOf(row []int) (int, bool) {
