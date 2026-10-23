@@ -6,6 +6,7 @@ package main
 
 import (
 	"bytes"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -574,6 +575,163 @@ func TestFieldTranslates(t *testing.T) {
 	if span < 0.95 || span > 1.05 {
 		t.Fatalf("edge stretched to %v", span)
 	}
+}
+
+func TestPixelForecast(t *testing.T) {
+	g, err := geom(16, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := make([]rgb, g.pixels)
+	for y := 0; y < g.h; y++ {
+		for x := 0; x < g.w; x++ {
+			base[y*g.w+x] = rgb{byte(20 + x*10), byte(20 + y*10), 80}
+		}
+	}
+	moved := make([]rgb, g.pixels)
+	for y := 0; y < g.h; y++ {
+		for x := 0; x < g.w; x++ {
+			dx := 1
+			if x >= g.w/2 {
+				dx = -1
+			}
+			moved[y*g.w+x] = sample(g, base, x-dx, y)
+		}
+	}
+	pix := [][]rgb{base, moved}
+	if fieldOfCells(g, pix[1]) {
+		t.Fatal("full picture was treated as cells")
+	}
+	raw := format(g, rate{4, 1}, pix)
+	blob, err := Compress(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	future, err := Predict(blob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := pix[1]
+	for dy := -g.mvRange; dy <= g.mvRange; dy++ {
+		for dx := -g.mvRange; dx <= g.mvRange; dx++ {
+			shift := make([]rgb, g.pixels)
+			for y := 0; y < g.h; y++ {
+				for x := 0; x < g.w; x++ {
+					shift[y*g.w+x] = sample(g, last, x-dx, y-dy)
+				}
+			}
+			if samePic(future[0], shift) {
+				t.Fatalf("forecast is a global shift %d,%d", dx, dy)
+			}
+		}
+	}
+	srcRough := roughEdges(last, g.w)
+	for i, frame := range future {
+		if rough := roughEdges(frame, g.w); rough > srcRough+2*g.h {
+			t.Fatalf("frame %d is pixelated: %d rough edges, source %d", i, rough, srcRough)
+		}
+	}
+}
+
+func TestFlowShear(t *testing.T) {
+	g, err := geom(64, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vecs := make([][2]int, g.nBlock)
+	for i, r := range tiles(g) {
+		if r.x*2 < g.w {
+			vecs[i] = [2]int{g.mvRange, 0}
+		} else {
+			vecs[i] = [2]int{-g.mvRange, 0}
+		}
+	}
+	n := (g.gridX + 1) * (g.gridY + 1)
+	ox := make([]float64, n)
+	oy := make([]float64, n)
+	mot := motion{blocks: flatField(g, vecs), warp: true}
+	for range 240 {
+		advanceFlow(g, ox, oy, matWarp, mot)
+	}
+	limit := float64(g.block) / 8
+	nx := g.gridX + 1
+	ny := g.gridY + 1
+	for j := 0; j < ny; j++ {
+		for i := 0; i < nx; i++ {
+			k := j*nx + i
+			if i+1 < nx && math.Hypot(ox[k+1]-ox[k], oy[k+1]-oy[k]) > limit+1e-6 {
+				t.Fatalf("horizontal shear %v", math.Hypot(ox[k+1]-ox[k], oy[k+1]-oy[k]))
+			}
+			if j+1 < ny && math.Hypot(ox[k+nx]-ox[k], oy[k+nx]-oy[k]) > limit+1e-6 {
+				t.Fatalf("vertical shear %v", math.Hypot(ox[k+nx]-ox[k], oy[k+nx]-oy[k]))
+			}
+		}
+	}
+	if ox[0] <= 0.5 || ox[nx-1] >= -0.5 {
+		t.Fatalf("opposing motion collapsed %v %v", ox[0], ox[nx-1])
+	}
+	prev := make([]rgb, g.pixels)
+	for y := 0; y < g.h; y++ {
+		for x := 0; x < g.w; x++ {
+			prev[y*g.w+x] = rgb{byte(8 + x*3), byte(8 + y*3), 70}
+		}
+	}
+	out := sampleFlow(g, prev, ox, oy)
+	if rough := roughEdges(out, g.w); rough > 2*g.h {
+		t.Fatalf("torn picture %d rough edges", rough)
+	}
+}
+
+func TestForecastSmooth(t *testing.T) {
+	g, err := geom(16, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev := make([]rgb, g.pixels)
+	for y := 0; y < g.h; y++ {
+		for x := 0; x < g.w; x++ {
+			prev[y*g.w+x] = rgb{byte(20 + x*8), byte(20 + y*8), 90}
+		}
+	}
+	a, b := &tri{}, &tri{}
+	for p := range g.pixels {
+		if p%2 == 0 {
+			a.pix = append(a.pix, p)
+		} else {
+			b.pix = append(b.pix, p)
+		}
+	}
+	a.dx, a.dy = g.mvRange, 0
+	b.dx, b.dy = -g.mvRange, 0
+	m := motion{warp: true, tris: triFrame{pair: [][2]*tri{{a, b}}}, blocks: flatField(g, nil)}
+	out := forecastPixels(g, prev, matWarp, m)
+	if !samePic(out, prev) {
+		t.Fatal("leaf velocities changed the picture")
+	}
+	if rough := roughEdges(out, g.w); rough > g.h {
+		t.Fatalf("forecast is pixelated: %d rough edges", rough)
+	}
+}
+
+func roughEdges(frame []rgb, w int) int {
+	n := 0
+	for i := 0; i+1 < len(frame); i++ {
+		if i%w == w-1 {
+			continue
+		}
+		d := 0
+		for c := range channels {
+			v := int(frame[i][c]) - int(frame[i+1][c])
+			if v < 0 {
+				v = -v
+			}
+			d += v
+		}
+		if d > 40 {
+			n++
+		}
+	}
+	return n
 }
 
 func TestPredict(t *testing.T) {

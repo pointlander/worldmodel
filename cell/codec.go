@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -422,8 +423,10 @@ func writeDelta(w *bits, p *plane, kPos, kVal int) {
 // learns. A draw proposes the next law and one velocity per top-level block;
 // the stored motion actually used is the one closest to that proposal.
 // matCopy repeats an earlier frame of this file, so the forecast draws from
-// the other laws. Each bright cell keeps the mesh built from the last frame,
-// and that mesh advances under the drawn law.
+// the other laws. Separate cells on a dark ground keep one mesh each. A
+// picture whose bright pixels are one region is warped by the block field.
+// The mean of that region would translate the whole frame, and the triangle
+// leaves would pull single pixels apart.
 func Predict(blob []byte) ([][]rgb, error) {
 	raw, err := Decompress(blob)
 	if err != nil {
@@ -435,10 +438,18 @@ func Predict(blob []byte) ([][]rgb, error) {
 	}
 	laws, vel, fields := learnCodec(g, pix)
 	last := pix[len(pix)-1]
-	bodies := components(g, last)
-	meshes := make([]feaMesh, len(bodies))
-	for i := range bodies {
-		meshes[i] = meshOf(g, last, &bodies[i])
+	var meshes []feaMesh
+	if fieldOfCells(g, last) {
+		bodies := components(g, last)
+		meshes = make([]feaMesh, len(bodies))
+		for i := range bodies {
+			meshes[i] = meshOf(g, last, &bodies[i])
+		}
+	}
+	var offX, offY []float64
+	if meshes == nil {
+		offX = make([]float64, (g.gridX+1)*(g.gridY+1))
+		offY = make([]float64, len(offX))
 	}
 	rng := lcg(1)
 	tops := tiles(g)
@@ -455,14 +466,211 @@ func Predict(blob []byte) ([][]rgb, error) {
 		} else {
 			mot.blocks = flatField(g, prop)
 		}
-		for i := range meshes {
-			meshes[i].advanceForecast(law, mot.blocks)
+		if meshes != nil {
+			for i := range meshes {
+				meshes[i].advanceForecast(law, mot.blocks)
+			}
+			out[f] = raster(g, meshes)
+		} else {
+			advanceFlow(g, offX, offY, law, mot)
+			out[f] = sampleFlow(g, last, offX, offY)
 		}
-		out[f] = raster(g, meshes)
 		laws.follow(law)
 		followMotion(vel, g, mot)
 	}
 	return out, nil
+}
+
+// fieldOfCells reports that every bright component is smaller than half the
+// frame. A larger component is the picture itself.
+func fieldOfCells(g geo, frame []rgb) bool {
+	largest := 0
+	for _, b := range components(g, frame) {
+		if len(b.pix) > largest {
+			largest = len(b.pix)
+		}
+	}
+	return largest*2 < g.pixels
+}
+
+// forecastPixels samples prev through the block field of the drawn law.
+// Triangle leaves code the residual of a warp frame, and painting them pulls
+// single pixels apart. A warp is sampled through the smoothed block grid.
+func forecastPixels(g geo, prev []rgb, law int, m motion) []rgb {
+	dx, dy := frameDisp(g, law, m.blocks)
+	sx, sy := meshSource(g, dx, dy)
+	dst := make([]rgb, g.pixels)
+	for p := range dst {
+		dst[p] = sample(g, prev, iround(sx[p]), iround(sy[p]))
+	}
+	return dst
+}
+
+// advanceFlow folds one frame of block motion into the picture displacement.
+// The sample is always the last real frame. Adjacent grid nodes stay within
+// an eighth of a block: integrated block velocities otherwise pull a circle
+// apart, and the resampled edge is a stair of pixels.
+func advanceFlow(g geo, offX, offY []float64, law int, m motion) {
+	vx, vy := frameDisp(g, law, m.blocks)
+	for i := range offX {
+		offX[i] += vx[i]
+		offY[i] += vy[i]
+	}
+	scaleShear(g, offX, offY, float64(g.block)/8)
+}
+
+// scaleShear shrinks the displacement toward its mean until every grid edge
+// is at most maxDiff long. The mean itself is the shared drift and is kept.
+func scaleShear(g geo, ox, oy []float64, maxDiff float64) {
+	nx := g.gridX + 1
+	ny := g.gridY + 1
+	maxEdge := 0.0
+	for j := 0; j < ny; j++ {
+		for i := 0; i < nx; i++ {
+			k := j*nx + i
+			if i+1 < nx {
+				if e := math.Hypot(ox[k+1]-ox[k], oy[k+1]-oy[k]); e > maxEdge {
+					maxEdge = e
+				}
+			}
+			if j+1 < ny {
+				if e := math.Hypot(ox[k+nx]-ox[k], oy[k+nx]-oy[k]); e > maxEdge {
+					maxEdge = e
+				}
+			}
+		}
+	}
+	if maxEdge <= maxDiff || maxEdge == 0 {
+		return
+	}
+	t := maxDiff / maxEdge
+	var sx, sy float64
+	for i := range ox {
+		sx += ox[i]
+		sy += oy[i]
+	}
+	mx := sx / float64(len(ox))
+	my := sy / float64(len(oy))
+	for i := range ox {
+		ox[i] = mx + t*(ox[i]-mx)
+		oy[i] = my + t*(oy[i]-my)
+	}
+}
+
+func sampleFlow(g geo, last []rgb, offX, offY []float64) []rgb {
+	dst := make([]rgb, g.pixels)
+	nx := g.gridX + 1
+	for y := 0; y < g.h; y++ {
+		for x := 0; x < g.w; x++ {
+			ox := flowAt(g, offX, nx, x, y)
+			oy := flowAt(g, offY, nx, x, y)
+			dst[y*g.w+x] = bilinearRGB(g, last, float64(x)-ox, float64(y)-oy)
+		}
+	}
+	return dst
+}
+
+func flowAt(g geo, field []float64, nx, x, y int) float64 {
+	bx := x / g.block
+	by := y / g.block
+	if bx >= g.gridX {
+		bx = g.gridX - 1
+	}
+	if by >= g.gridY {
+		by = g.gridY - 1
+	}
+	x0, y0 := nodeRest(g, bx, by)
+	x1, y1 := nodeRest(g, bx+1, by+1)
+	tx, ty := 0.0, 0.0
+	if x1 > x0 {
+		tx = (float64(x) - x0) / (x1 - x0)
+	}
+	if y1 > y0 {
+		ty = (float64(y) - y0) / (y1 - y0)
+	}
+	k00 := by*nx + bx
+	k10 := k00 + 1
+	k01 := k00 + nx
+	k11 := k01 + 1
+	a := field[k00]*(1-tx) + field[k10]*tx
+	b := field[k01]*(1-tx) + field[k11]*tx
+	return a*(1-ty) + b*ty
+}
+
+func bilinearRGB(g geo, src []rgb, x, y float64) rgb {
+	if x < 0 {
+		x = 0
+	}
+	if y < 0 {
+		y = 0
+	}
+	maxX := float64(g.w - 1)
+	maxY := float64(g.h - 1)
+	if x > maxX {
+		x = maxX
+	}
+	if y > maxY {
+		y = maxY
+	}
+	x0 := int(x)
+	y0 := int(y)
+	x1 := x0 + 1
+	if x1 >= g.w {
+		x1 = g.w - 1
+	}
+	y1 := y0 + 1
+	if y1 >= g.h {
+		y1 = g.h - 1
+	}
+	tx := x - float64(x0)
+	ty := y - float64(y0)
+	var out rgb
+	for c := range channels {
+		f00 := float64(src[y0*g.w+x0][c])
+		f10 := float64(src[y0*g.w+x1][c])
+		f01 := float64(src[y1*g.w+x0][c])
+		f11 := float64(src[y1*g.w+x1][c])
+		v := (f00*(1-tx)+f10*tx)*(1-ty) + (f01*(1-tx)+f11*tx)*ty
+		if v < 0 {
+			v = 0
+		}
+		if v > 255 {
+			v = 255
+		}
+		out[c] = byte(v + 0.5)
+	}
+	return out
+}
+
+func frameDisp(g geo, law int, blocks []blk) ([]float64, []float64) {
+	means := meansOf(blocks)
+	switch law {
+	case matHalf:
+		vx, vy := nodeVelocity(g, means)
+		for i := range vx {
+			vx[i] *= 0.5
+			vy[i] *= 0.5
+		}
+		return vx, vy
+	case matSoft:
+		return elasticDisp(g, means, lawSoft)
+	case matStiff:
+		return elasticDisp(g, means, lawStiff)
+	default:
+		return nodeVelocity(g, means)
+	}
+}
+
+func elasticDisp(g geo, means [][2]float64, law feaLaw) ([]float64, []float64) {
+	m := gridMesh(g, means)
+	m.coastLaw(1, law)
+	dx := make([]float64, len(m.nodes))
+	dy := make([]float64, len(m.nodes))
+	for i, n := range m.nodes {
+		dx[i] = n.x - n.X
+		dy[i] = n.y - n.Y
+	}
+	return dx, dy
 }
 
 // learnCodec replays the encoder's choices so the forecast chains match the

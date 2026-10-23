@@ -565,8 +565,20 @@ func nodeVelocity(g geo, means [][2]float64) (vx, vy []float64) {
 // by at most the search radius, so the covering triangle is the pixel's block
 // or a neighbor. A pixel that lands in no triangle keeps its previous color.
 func sampleMesh(g geo, prev []rgb, dispX, dispY []float64) []rgb {
-	nx := g.gridX + 1
+	sx, sy := meshSource(g, dispX, dispY)
 	dst := make([]rgb, g.pixels)
+	for p := range dst {
+		dst[p] = sample(g, prev, iround(sx[p]), iround(sy[p]))
+	}
+	return dst
+}
+
+// meshSource is where each pixel samples the previous picture. A pixel the
+// grid does not cover keeps its own coordinate.
+func meshSource(g geo, dispX, dispY []float64) (sx, sy []float64) {
+	nx := g.gridX + 1
+	sx = make([]float64, g.pixels)
+	sy = make([]float64, g.pixels)
 	for y := 0; y < g.h; y++ {
 		by := y / g.block
 		if by >= g.gridY {
@@ -577,15 +589,17 @@ func sampleMesh(g geo, prev []rgb, dispX, dispY []float64) []rgb {
 			if bx >= g.gridX {
 				bx = g.gridX - 1
 			}
-			sx, sy, ok := coverBlock(g, nx, dispX, dispY, bx, by, float64(x), float64(y))
+			ox, oy, ok := coverBlock(g, nx, dispX, dispY, bx, by, float64(x), float64(y))
+			p := y*g.w + x
 			if !ok {
-				dst[y*g.w+x] = prev[y*g.w+x]
+				sx[p] = float64(x)
+				sy[p] = float64(y)
 				continue
 			}
-			dst[y*g.w+x] = sample(g, prev, iround(sx), iround(sy))
+			sx[p], sy[p] = ox, oy
 		}
 	}
-	return dst
+	return sx, sy
 }
 
 func coverBlock(g geo, nx int, dispX, dispY []float64, bx, by int, px, py float64) (float64, float64, bool) {
