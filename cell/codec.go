@@ -33,7 +33,7 @@ var (
 )
 
 // CompressedSize is the length of the blob for the canonical 32x32 cell.csv.
-const CompressedSize = 22985
+const CompressedSize = 22993
 
 // maxSamples bounds a decoded clip. The full-resolution canonical clip is
 // about 30 million samples; a longer file that would not fit is rejected.
@@ -69,6 +69,14 @@ var bg = rgb{0, 0, 1}
 // block and moves the grid by that velocity. The sample under (x, y) for a
 // velocity (dx, dy) is the previous pixel at (x-dx, y-dy). Off-frame samples
 // are black, which is not the background.
+//
+// The same pixel chain the forecast uses may correct that sample. The chain
+// is second-order in the previous two channel values at the motion source.
+// An empty pair uses the previous value alone. The sample stands when it is
+// unseen or at least as common as the mode. When the correction differs from
+// the motion sample, one bit after the motion selects it if its residual is
+// strictly smaller. A tie keeps the motion sample. The chain itself is not
+// written; both sides learn it from the frames already coded.
 //
 // The residual is the samples that differ from that prediction, a gap into
 // the frame and a zigzag Rice value. The three channels are separate streams
@@ -205,15 +213,25 @@ func Compress(src []byte) ([]byte, error) {
 	}
 	laws := newMatChain()
 	vel := newVecChain(g)
+	colors := newPixChain(g.pixels)
+	colors.observeFrame(nil, pix[0])
 	for t := 1; t < len(pix); t++ {
-		mot, law := fitCoded(g, pix, t, vel, laws)
+		mot, law := fitCoded(g, pix, t, vel, laws, colors)
 		writeLaw(&w, laws, law)
 		if law != matCopy {
 			writeMotion(&w, vel, g, mot)
 			vel.endFrame()
 		}
-		pred := predictMotion(g, pix, t, law, mot)
+		pred, src, changed, better := codedFrame(g, pix, t, law, mot, colors)
+		if changed {
+			bit := 0
+			if better {
+				bit = 1
+			}
+			w.bits(bit, 1)
+		}
 		mis := frameResidual(pred, pix[t])
+		colors.observeFrame(src, pix[t])
 		kGap, kDel := kGapM, kDelta
 		if law == matCopy {
 			kGap, kDel = kGapH, kDeltaH
@@ -266,10 +284,10 @@ type motion struct {
 // fitCoded chooses the motion that will be written. matWarp is the triangle
 // partition. A mesh law is the flat block search, because the grid moves by
 // one velocity per block.
-func fitCoded(g geo, pix [][]rgb, t int, vel *vecChain, laws *matChain) (motion, int) {
+func fitCoded(g geo, pix [][]rgb, t int, vel *vecChain, laws *matChain, colors *pixChain) (motion, int) {
 	tris := fitTris(g, pix[t-1], pix[t], vel)
 	flat := fitFlat(g, pix[t-1], pix[t])
-	law := pickLaw(g, pix, t, tris, flat, laws)
+	law := pickLaw(g, pix, t, tris, flat, laws, colors)
 	m := motion{blocks: flat}
 	if law == matWarp {
 		m.tris = tris
@@ -279,12 +297,12 @@ func fitCoded(g geo, pix [][]rgb, t int, vel *vecChain, laws *matChain) (motion,
 	return m, law
 }
 
-func pickLaw(g geo, pix [][]rgb, t int, tris triFrame, flat []blk, laws *matChain) int {
+func pickLaw(g geo, pix [][]rgb, t int, tris triFrame, flat []blk, laws *matChain, colors *pixChain) int {
 	best := laws.proposal()
 	if best < 0 || best >= matN || (best == matCopy && !copyLegal(len(pix), t)) {
 		best = matWarp
 	}
-	bestCost := motionCost(g, pix, t, best, tris, flat)
+	bestCost := motionCost(g, pix, t, best, tris, flat, colors)
 	zero := flatZero(flat)
 	for law := range matN {
 		if law == best {
@@ -299,7 +317,7 @@ func pickLaw(g geo, pix [][]rgb, t int, tris triFrame, flat []blk, laws *matChai
 		if zero && law != matCopy && law != matWarp {
 			continue
 		}
-		if c := motionCost(g, pix, t, law, tris, flat); c < bestCost {
+		if c := motionCost(g, pix, t, law, tris, flat, colors); c < bestCost {
 			best, bestCost = law, c
 		}
 	}
@@ -315,28 +333,74 @@ func flatZero(blocks []blk) bool {
 	return true
 }
 
-func motionCost(g geo, pix [][]rgb, t, law int, tris triFrame, flat []blk) int {
-	return sad(pix[t], predictChoice(g, pix, t, law, tris, flat))
+func motionCost(g geo, pix [][]rgb, t, law int, tris triFrame, flat []blk, colors *pixChain) int {
+	_, _, cost, _, _ := scoredFrame(g, pix, t, law, tris, flat, colors)
+	return cost
 }
 
 func predictChoice(g geo, pix [][]rgb, t, law int, tris triFrame, flat []blk) []rgb {
-	if law == matCopy {
-		return pix[t-len(pix)/2]
-	}
-	if law == matWarp {
-		return tris.paint(g, pix[t-1])
-	}
-	return predictTrees(g, pix, t, law, flat)
+	frame, _ := predictSpatial(g, pix, t, law, tris, flat)
+	return frame
 }
 
 func predictMotion(g geo, pix [][]rgb, t, law int, m motion) []rgb {
+	frame, _ := predictSpatial(g, pix, t, law, m.tris, m.blocks)
+	return frame
+}
+
+// predictSpatial is the motion sample and the pixel it came from. Copy has
+// no motion source. An off-frame sample is a negative index.
+func predictSpatial(g geo, pix [][]rgb, t, law int, tris triFrame, blocks []blk) ([]rgb, []int) {
 	if law == matCopy {
-		return append([]rgb(nil), pix[t-len(pix)/2]...)
+		return append([]rgb(nil), pix[t-len(pix)/2]...), nil
 	}
-	if m.warp {
-		return m.tris.paint(g, pix[t-1])
+	prev := pix[t-1]
+	if law == matWarp {
+		return tris.paintSources(g, prev)
 	}
-	return predictTrees(g, pix, t, law, m.blocks)
+	switch law {
+	case matSmooth, matHalf, matSoft, matStiff:
+		dx, dy := frameDisp(g, law, blocks)
+		return meshSources(g, prev, dx, dy)
+	default:
+		return treeSources(g, prev, blocks)
+	}
+}
+
+// chainCorrection is the pixel-chain sample. changed is true when it differs
+// from the motion sample, which is the only time a bit is stored.
+func chainCorrection(colors *pixChain, spatial []rgb, src []int) ([]rgb, bool) {
+	if colors == nil {
+		return spatial, false
+	}
+	mixed := colors.mixFrame(spatial, src)
+	for i := range spatial {
+		if mixed[i] != spatial[i] {
+			return mixed, true
+		}
+	}
+	return spatial, false
+}
+
+// scoredFrame is the coded prediction for one law. changed means the chain
+// names another color. better means that color has a strictly smaller residual.
+func scoredFrame(g geo, pix [][]rgb, t, law int, tris triFrame, blocks []blk, colors *pixChain) (pred []rgb, src []int, cost int, changed, better bool) {
+	spatial, src := predictSpatial(g, pix, t, law, tris, blocks)
+	cost = sad(pix[t], spatial)
+	mixed, changed := chainCorrection(colors, spatial, src)
+	if !changed {
+		return spatial, src, cost, false, false
+	}
+	if c := sad(pix[t], mixed); c < cost {
+		return mixed, src, c, true, true
+	}
+	return spatial, src, cost, true, false
+}
+
+// codedFrame is the prediction written for the chosen law.
+func codedFrame(g geo, pix [][]rgb, t, law int, m motion, colors *pixChain) ([]rgb, []int, bool, bool) {
+	pred, src, _, changed, better := scoredFrame(g, pix, t, law, m.tris, m.blocks, colors)
+	return pred, src, changed, better
 }
 
 func writeMotion(w *bits, vel *vecChain, g geo, m motion) {
@@ -721,33 +785,17 @@ func learnCodec(g geo, pix [][]rgb) (*matChain, *vecChain, []motion, *pixChain) 
 	colors.observeFrame(nil, pix[0])
 	fields := make([]motion, 0, len(pix)-1)
 	for t := 1; t < len(pix); t++ {
-		mot, law := fitCoded(g, pix, t, vel, laws)
+		mot, law := fitCoded(g, pix, t, vel, laws, colors)
 		laws.observe(law)
-		var src []int
 		if law != matCopy {
 			fields = append(fields, mot)
 			observeMotion(vel, g, mot)
 			vel.endFrame()
-			_, src = motionSources(g, pix[t-1], law, mot)
 		}
+		_, src := predictSpatial(g, pix, t, law, mot.tris, mot.blocks)
 		colors.observeFrame(src, pix[t])
 	}
 	return laws, vel, fields, colors
-}
-
-// motionSources is the pixel each coded prediction samples. Copy has no
-// motion source. Off-frame samples are negative.
-func motionSources(g geo, prev []rgb, law int, m motion) ([]rgb, []int) {
-	if m.warp || law == matWarp {
-		return m.tris.paintSources(g, prev)
-	}
-	switch law {
-	case matSmooth, matHalf, matSoft, matStiff:
-		dx, dy := frameDisp(g, law, m.blocks)
-		return meshSources(g, prev, dx, dy)
-	default:
-		return treeSources(g, prev, m.blocks)
-	}
 }
 
 func treeSources(g geo, prev []rgb, trees []blk) ([]rgb, []int) {
@@ -1182,6 +1230,8 @@ func Decompress(src []byte) ([]byte, error) {
 	}
 	laws := newMatChain()
 	vel := newVecChain(g)
+	colors := newPixChain(g.pixels)
+	colors.observeFrame(nil, pix[0])
 	for t := 1; t < n; t++ {
 		law, err := readLaw(&r, laws)
 		if err != nil {
@@ -1199,7 +1249,19 @@ func Decompress(src []byte) ([]byte, error) {
 			}
 			vel.endFrame()
 		}
-		pix[t] = predictMotion(g, pix, t, law, mot)
+		spatial, src := predictSpatial(g, pix, t, law, mot.tris, mot.blocks)
+		mixed, changed := chainCorrection(colors, spatial, src)
+		pred := spatial
+		if changed {
+			mixBit, err := r.bits(1)
+			if err != nil {
+				return nil, err
+			}
+			if mixBit == 1 {
+				pred = mixed
+			}
+		}
+		pix[t] = pred
 		var nMis [channels]int
 		for c := range nMis {
 			v, err := r.bits(bitsN)
@@ -1217,6 +1279,7 @@ func Decompress(src []byte) ([]byte, error) {
 				return nil, err
 			}
 		}
+		colors.observeFrame(src, pix[t])
 	}
 	if err := r.done(); err != nil {
 		return nil, err

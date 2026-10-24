@@ -413,6 +413,8 @@ func TestTriangles(t *testing.T) {
 	}
 	vel := newVecChain(cg)
 	laws := newMatChain()
+	colors := newPixChain(cg.pixels)
+	colors.observeFrame(nil, frames[0])
 	splits, leaves := 0, 0
 	var hist [matN]int
 	var walk func(*tri)
@@ -429,20 +431,21 @@ func TestTriangles(t *testing.T) {
 		}
 	}
 	for tix := 1; tix < len(frames); tix++ {
-		mot, law := fitCoded(cg, frames, tix, vel, laws)
+		mot, law := fitCoded(cg, frames, tix, vel, laws, colors)
 		hist[law]++
 		laws.observe(law)
-		if law == matCopy {
-			continue
-		}
-		if mot.warp {
-			for _, ab := range mot.tris.pair {
-				walk(ab[0])
-				walk(ab[1])
+		if law != matCopy {
+			if mot.warp {
+				for _, ab := range mot.tris.pair {
+					walk(ab[0])
+					walk(ab[1])
+				}
 			}
+			observeMotion(vel, cg, mot)
+			vel.endFrame()
 		}
-		observeMotion(vel, cg, mot)
-		vel.endFrame()
+		_, src := predictSpatial(cg, frames, tix, law, mot.tris, mot.blocks)
+		colors.observeFrame(src, frames[tix])
 	}
 	if splits == 0 || leaves == 0 {
 		t.Fatalf("canonical triangles splits %d leaves %d", splits, leaves)

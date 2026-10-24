@@ -27,7 +27,7 @@ The default picture is 32×32. `-size full` keeps the video's own frame size. `-
 
 `predict` reads that blob, appends 8 seconds of forecast frames at the clip's frame rate, and writes a WebM. The frames go to ffmpeg as rgb24 and are stored with lossless VP9. A second-order Markov chain draws the next law and motion, falling back to the previous symbol alone when that pair is empty. Cells on a dark ground advance as elastic meshes. A picture that is mostly bright is warped by the block motion and sampled from the last frame. Grid nodes stay within an eighth of a block of their neighbors, so the warp does not tear the picture into pixels. A second-order Markov model of each pixel's color, falling back to the previous color alone, replaces that sample when the sample is a less common continuation.
 
-The compressor predicts each frame after the first. A block warp cuts every block into two triangles and may split a triangle at the midpoints of its edges. A mesh law moves the grid by one velocity per block. In the second half of an even-length clip, a frame may repeat its paired earlier frame. The canonical 32×32 clip compresses to 22985 bytes.
+The compressor predicts each frame after the first. A block warp cuts every block into two triangles and may split a triangle at the midpoints of its edges. A mesh law moves the grid by one velocity per block. In the second half of an even-length clip, a frame may repeat its paired earlier frame. The same per-pixel chain replaces the motion sample on a frame when that correction is smaller. The canonical 32×32 clip compresses to 22993 bytes.
 
 ## iris
 
