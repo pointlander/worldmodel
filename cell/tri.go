@@ -162,24 +162,47 @@ func (t *tri) quarter(g geo) []*tri {
 }
 
 func (t *tri) paint(g geo, prev, dst []rgb) {
+	t.paintSrc(g, prev, dst, nil)
+}
+
+func (t *tri) paintSrc(g geo, prev, dst []rgb, src []int) {
 	if len(t.sub) > 0 {
 		for _, k := range t.sub {
-			k.paint(g, prev, dst)
+			k.paintSrc(g, prev, dst, src)
 		}
 		return
 	}
 	for _, p := range t.pix {
-		dst[p] = sample(g, prev, p%g.w-t.dx, p/g.w-t.dy)
+		x, y := p%g.w, p/g.w
+		sx, sy := x-t.dx, y-t.dy
+		dst[p] = sample(g, prev, sx, sy)
+		if src == nil {
+			continue
+		}
+		if uint(sx) >= uint(g.w) || uint(sy) >= uint(g.h) {
+			src[p] = -1
+		} else {
+			src[p] = sy*g.w + sx
+		}
 	}
 }
 
 func (f triFrame) paint(g geo, prev []rgb) []rgb {
-	dst := make([]rgb, g.pixels)
-	for _, ab := range f.pair {
-		ab[0].paint(g, prev, dst)
-		ab[1].paint(g, prev, dst)
-	}
+	dst, _ := f.paintSources(g, prev)
 	return dst
+}
+
+func (f triFrame) paintSources(g geo, prev []rgb) ([]rgb, []int) {
+	dst := make([]rgb, g.pixels)
+	src := make([]int, g.pixels)
+	for i := range src {
+		src[i] = -1
+	}
+	for _, ab := range f.pair {
+		ab[0].paintSrc(g, prev, dst, src)
+		ab[1].paintSrc(g, prev, dst, src)
+	}
+	return dst, src
 }
 
 func (t *tri) write(w *bits, vel *vecChain, g geo) {

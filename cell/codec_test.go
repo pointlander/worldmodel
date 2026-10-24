@@ -633,6 +633,69 @@ func TestPixelForecast(t *testing.T) {
 	}
 }
 
+func TestPixMix(t *testing.T) {
+	m := newPixChain(1)
+	for _, v := range []byte{1, 2, 9, 1, 2, 9, 1, 2, 9, 1, 2, 4} {
+		m.observeFrame(nil, []rgb{{v, 0, 0}})
+	}
+	m.prev2[0] = rgb{1, 0, 0}
+	m.prev[0] = rgb{2, 0, 0}
+	m.frames = 2
+	if got := m.mixOne(0, 0, 4); got != 9 {
+		t.Fatalf("second order %d", got)
+	}
+	if got := m.mixOne(0, 0, 9); got != 9 {
+		t.Fatalf("mode kept %d", got)
+	}
+	if got := m.mixOne(0, 0, 3); got != 3 {
+		t.Fatalf("unseen spatial %d", got)
+	}
+	m.prev2[0] = rgb{8, 0, 0}
+	m.prev[0] = rgb{2, 0, 0}
+	if got := m.mixOne(0, 0, 4); got != 9 {
+		t.Fatalf("first order %d", got)
+	}
+	m.prev2[0] = rgb{8, 0, 0}
+	m.prev[0] = rgb{7, 0, 0}
+	if got := m.mixOne(0, 0, 5); got != 5 {
+		t.Fatalf("empty context %d", got)
+	}
+}
+
+func TestPixForecast(t *testing.T) {
+	g, err := geom(8, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seq := []byte{40, 40, 90, 40, 40, 90, 40, 40, 90, 40, 40, 40}
+	pix := make([][]rgb, len(seq))
+	for i, v := range seq {
+		frame := make([]rgb, g.pixels)
+		for p := range frame {
+			frame[p] = rgb{v, v, v}
+		}
+		pix[i] = frame
+	}
+	if fieldOfCells(g, pix[len(pix)-1]) {
+		t.Fatal("full picture was treated as cells")
+	}
+	raw := format(g, rate{4, 1}, pix)
+	blob, err := Compress(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	future, err := Predict(blob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := rgb{90, 90, 90}
+	for p, c := range future[0] {
+		if c != want {
+			t.Fatalf("pixel %d is %v, want %v", p, c, want)
+		}
+	}
+}
+
 func TestFlowShear(t *testing.T) {
 	g, err := geom(64, 64)
 	if err != nil {

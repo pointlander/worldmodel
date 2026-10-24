@@ -62,6 +62,7 @@ type feaNode struct {
 	vx, vy float64
 	m      float64
 	col    rgb
+	home   int
 }
 
 type feaElem struct {
@@ -81,7 +82,7 @@ func meshOf(g geo, frame []rgb, b *body) feaMesh {
 	idx := make(map[int]int, len(b.pix))
 	for i, p := range b.pix {
 		x, y := float64(p%g.w), float64(p/g.w)
-		m.nodes[i] = feaNode{x: x, y: y, X: x, Y: y, col: frame[p]}
+		m.nodes[i] = feaNode{x: x, y: y, X: x, Y: y, col: frame[p], home: p}
 		idx[p] = i
 	}
 	for _, p := range b.pix {
@@ -336,15 +337,17 @@ func (m *feaMesh) blockAt(x, y float64) int {
 	return (iy/m.g.block)*m.g.gridX + ix/m.g.block
 }
 
-func raster(g geo, meshes []feaMesh) []rgb {
+func raster(g geo, meshes []feaMesh) ([]rgb, []int) {
 	frame := make([]rgb, g.pixels)
+	src := make([]int, g.pixels)
 	for i := range frame {
 		frame[i] = bg
+		src[i] = -1
 	}
 	for mi := range meshes {
 		m := &meshes[mi]
 		for ei := range m.elems {
-			paintTri(g, frame, m, &m.elems[ei])
+			paintTri(g, frame, src, m, &m.elems[ei])
 		}
 		for i := range m.nodes {
 			n := &m.nodes[i]
@@ -352,13 +355,15 @@ func raster(g geo, meshes []feaMesh) []rgb {
 			if uint(ix) >= uint(g.w) || uint(iy) >= uint(g.h) {
 				continue
 			}
-			frame[iy*g.w+ix] = n.col
+			p := iy*g.w + ix
+			frame[p] = n.col
+			src[p] = n.home
 		}
 	}
-	return frame
+	return frame, src
 }
 
-func paintTri(g geo, frame []rgb, m *feaMesh, e *feaElem) {
+func paintTri(g geo, frame []rgb, src []int, m *feaMesh, e *feaElem) {
 	n0 := &m.nodes[e.n[0]]
 	n1 := &m.nodes[e.n[1]]
 	n2 := &m.nodes[e.n[2]]
@@ -391,13 +396,23 @@ func paintTri(g geo, frame []rgb, m *feaMesh, e *feaElem) {
 			if a < -1e-6 || b < -1e-6 || c < -1e-6 {
 				continue
 			}
+			p := y*g.w + x
 			switch {
 			case a >= b && a >= c:
-				frame[y*g.w+x] = n0.col
+				frame[p] = n0.col
+				if src != nil {
+					src[p] = n0.home
+				}
 			case b >= c:
-				frame[y*g.w+x] = n1.col
+				frame[p] = n1.col
+				if src != nil {
+					src[p] = n1.home
+				}
 			default:
-				frame[y*g.w+x] = n2.col
+				frame[p] = n2.col
+				if src != nil {
+					src[p] = n2.home
+				}
 			}
 		}
 	}
@@ -565,12 +580,24 @@ func nodeVelocity(g geo, means [][2]float64) (vx, vy []float64) {
 // by at most the search radius, so the covering triangle is the pixel's block
 // or a neighbor. A pixel that lands in no triangle keeps its previous color.
 func sampleMesh(g geo, prev []rgb, dispX, dispY []float64) []rgb {
+	dst, _ := meshSources(g, prev, dispX, dispY)
+	return dst
+}
+
+func meshSources(g geo, prev []rgb, dispX, dispY []float64) ([]rgb, []int) {
 	sx, sy := meshSource(g, dispX, dispY)
 	dst := make([]rgb, g.pixels)
+	src := make([]int, g.pixels)
 	for p := range dst {
-		dst[p] = sample(g, prev, iround(sx[p]), iround(sy[p]))
+		ix, iy := iround(sx[p]), iround(sy[p])
+		dst[p] = sample(g, prev, ix, iy)
+		if uint(ix) >= uint(g.w) || uint(iy) >= uint(g.h) {
+			src[p] = -1
+		} else {
+			src[p] = iy*g.w + ix
+		}
 	}
-	return dst
+	return dst, src
 }
 
 // meshSource is where each pixel samples the previous picture. A pixel the

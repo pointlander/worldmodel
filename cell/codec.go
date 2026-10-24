@@ -426,7 +426,9 @@ func writeDelta(w *bits, p *plane, kPos, kVal int) {
 // the other laws. Separate cells on a dark ground keep one mesh each. A
 // picture whose bright pixels are one region is warped by the block field.
 // The mean of that region would translate the whole frame, and the triangle
-// leaves would pull single pixels apart.
+// leaves would pull single pixels apart. A second-order chain predicts each
+// pixel from the motion source and replaces the sample when that color is a
+// less common continuation. An empty pair uses the previous color alone.
 func Predict(blob []byte) ([][]rgb, error) {
 	raw, err := Decompress(blob)
 	if err != nil {
@@ -436,7 +438,7 @@ func Predict(blob []byte) ([][]rgb, error) {
 	if err != nil {
 		return nil, err
 	}
-	laws, vel, fields := learnCodec(g, pix)
+	laws, vel, fields, colors := learnCodec(g, pix)
 	last := pix[len(pix)-1]
 	var meshes []feaMesh
 	if fieldOfCells(g, last) {
@@ -470,10 +472,12 @@ func Predict(blob []byte) ([][]rgb, error) {
 			for i := range meshes {
 				meshes[i].advanceForecast(law, mot.blocks)
 			}
-			out[f] = raster(g, meshes)
+			spatial, src := raster(g, meshes)
+			out[f] = colors.mixFrame(spatial, src)
 		} else {
 			advanceFlow(g, offX, offY, law, mot)
-			out[f] = sampleFlow(g, last, offX, offY)
+			spatial := sampleFlow(g, last, offX, offY)
+			out[f] = colors.mixFrame(spatial, flowSources(g, offX, offY))
 		}
 		laws.follow(law)
 		followMotion(vel, g, mot)
@@ -568,6 +572,40 @@ func sampleFlow(g geo, last []rgb, offX, offY []float64) []rgb {
 		}
 	}
 	return dst
+}
+
+func flowSources(g geo, offX, offY []float64) []int {
+	src := make([]int, g.pixels)
+	nx := g.gridX + 1
+	maxX := float64(g.w - 1)
+	maxY := float64(g.h - 1)
+	for y := 0; y < g.h; y++ {
+		for x := 0; x < g.w; x++ {
+			sx := float64(x) - flowAt(g, offX, nx, x, y)
+			sy := float64(y) - flowAt(g, offY, nx, x, y)
+			if sx < 0 {
+				sx = 0
+			}
+			if sy < 0 {
+				sy = 0
+			}
+			if sx > maxX {
+				sx = maxX
+			}
+			if sy > maxY {
+				sy = maxY
+			}
+			ix, iy := iround(sx), iround(sy)
+			if ix >= g.w {
+				ix = g.w - 1
+			}
+			if iy >= g.h {
+				iy = g.h - 1
+			}
+			src[y*g.w+x] = iy*g.w + ix
+		}
+	}
+	return src
 }
 
 func flowAt(g geo, field []float64, nx, x, y int) float64 {
@@ -674,22 +712,61 @@ func elasticDisp(g geo, means [][2]float64, law feaLaw) ([]float64, []float64) {
 }
 
 // learnCodec replays the encoder's choices so the forecast chains match the
-// chains that were coded. Copy frames have no velocity field.
-func learnCodec(g geo, pix [][]rgb) (*matChain, *vecChain, []motion) {
+// chains that were coded. Copy frames have no velocity field. The pixel chain
+// still sees them, with a co-located source.
+func learnCodec(g geo, pix [][]rgb) (*matChain, *vecChain, []motion, *pixChain) {
 	laws := newMatChain()
 	vel := newVecChain(g)
+	colors := newPixChain(g.pixels)
+	colors.observeFrame(nil, pix[0])
 	fields := make([]motion, 0, len(pix)-1)
 	for t := 1; t < len(pix); t++ {
 		mot, law := fitCoded(g, pix, t, vel, laws)
 		laws.observe(law)
-		if law == matCopy {
-			continue
+		var src []int
+		if law != matCopy {
+			fields = append(fields, mot)
+			observeMotion(vel, g, mot)
+			vel.endFrame()
+			_, src = motionSources(g, pix[t-1], law, mot)
 		}
-		fields = append(fields, mot)
-		observeMotion(vel, g, mot)
-		vel.endFrame()
+		colors.observeFrame(src, pix[t])
 	}
-	return laws, vel, fields
+	return laws, vel, fields, colors
+}
+
+// motionSources is the pixel each coded prediction samples. Copy has no
+// motion source. Off-frame samples are negative.
+func motionSources(g geo, prev []rgb, law int, m motion) ([]rgb, []int) {
+	if m.warp || law == matWarp {
+		return m.tris.paintSources(g, prev)
+	}
+	switch law {
+	case matSmooth, matHalf, matSoft, matStiff:
+		dx, dy := frameDisp(g, law, m.blocks)
+		return meshSources(g, prev, dx, dy)
+	default:
+		return treeSources(g, prev, m.blocks)
+	}
+}
+
+func treeSources(g geo, prev []rgb, trees []blk) ([]rgb, []int) {
+	dst := make([]rgb, g.pixels)
+	src := make([]int, g.pixels)
+	for y := 0; y < g.h; y++ {
+		for x := 0; x < g.w; x++ {
+			dx, dy := velAt(g, trees, x, y)
+			sx, sy := x-dx, y-dy
+			p := y*g.w + x
+			dst[p] = sample(g, prev, sx, sy)
+			if uint(sx) >= uint(g.w) || uint(sy) >= uint(g.h) {
+				src[p] = -1
+			} else {
+				src[p] = sy*g.w + sx
+			}
+		}
+	}
+	return dst, src
 }
 
 func nearestMotion(fields []motion, prop [][2]int) motion {
